@@ -1,0 +1,35 @@
+# Job search criteria for Chen Yang Xu — Biostatistics / Bioinformatics
+
+job_titles:
+  - "Biostatistician"
+  - "Statistical Programmer"
+  - "Bioinformatics Scientist"
+  - "Bioinformatics Analyst"
+  - "Clinical Biostatistician"
+  - "Bioinformatics Engineer"
+  - "Statistical Data Analyst"
+  - "Research Scientist Bioinformatics"
+
+locations:
+  - "Remote"
+  - "California, United States"
+  - "Toronto, Ontario, Canada"
+
+# Minimum annual salary in USD (0 = no filter)
+salary_min: 0
+
+# Keywords that MUST appear somewhere in the job description
+keywords_required: []
+
+# Skip jobs containing any of these keywords
+keywords_excluded:
+  - "unpaid"
+  - "clearance required"
+  - "top secret"
+
+# Max years of experience required (0 = no filter)
+experience_years_max: 0
+
+# Sources to scrape
+sources:
+  - linkedin

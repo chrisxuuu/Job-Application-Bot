@@ -1,0 +1,32 @@
+# === SECRETS — never commit these ===
+.env
+.env.local
+.env.*.local
+
+# === Personal data — never commit these ===
+data/resume.md
+data/profile.yaml
+
+# === Database & runtime data ===
+data/applications.db
+data/screenshots/
+
+# === Browser profiles (contain session cookies) ===
+~/.job_bot/
+.job_bot/
+
+# === Claude Code local settings ===
+.claude/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/

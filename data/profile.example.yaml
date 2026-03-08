@@ -1,0 +1,45 @@
+# profile.example.yaml — copy to profile.yaml and fill in your real info.
+# data/profile.yaml is in .gitignore and will never be committed.
+#
+# Usage: cp data/profile.example.yaml data/profile.yaml
+
+name: "Your Name"
+email: "email@example.com"
+phone: "555-555-5555"
+
+years_of_experience: 3
+
+current_title: "Your Current Title"
+
+target_titles:
+  - "Target Job Title 1"
+  - "Target Job Title 2"
+
+salary_expectation_min: 80000
+salary_expectation_max: 130000
+
+work_authorization: true
+requires_visa_sponsorship: false
+
+open_to_relocation: true
+preferred_work_arrangement: "remote"  # remote | hybrid | onsite
+
+skills:
+  languages:
+    - Python
+    - R
+  domain:
+    - Tool 1
+    - Tool 2
+
+experience_years_by_tech:
+  Python: 3
+  R: 4
+
+linkedin_url: "https://linkedin.com/in/yourhandle"
+github_url: "https://github.com/yourhandle"
+
+why_this_company_default: >
+  I am excited to apply my skills to challenging problems in this field.
+
+available_to_start: "2 weeks notice"
