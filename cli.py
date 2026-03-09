@@ -19,7 +19,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(help="Automated job bot powered by Claude AI", no_args_is_help=True)
+app = typer.Typer(help="Automated job bot", no_args_is_help=True)
 console = Console()
 
 
