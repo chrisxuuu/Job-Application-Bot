@@ -4,8 +4,8 @@ from pathlib import Path
 
 from rich.console import Console
 
-from job_bot.ai.client import get_client
 from job_bot.ai.evaluator import EvaluationResult
+from job_bot.ai.ollama_client import ollama_chat
 from job_bot.models.job import Job
 
 console = Console()
@@ -25,8 +25,7 @@ Rules:
 
 
 def generate_cover_letter(job: Job, evaluation: EvaluationResult) -> str:
-    """Generate a tailored cover letter for the given job using Claude."""
-    client = get_client()
+    """Generate a tailored cover letter. Uses Qwen3 (Ollama) as primary, Claude as fallback."""
     from config.settings import settings
 
     resume_path = Path(settings.resume_path)
@@ -49,7 +48,22 @@ Candidate Resume:
 
 Write the cover letter body now (3 paragraphs, ~250 words):"""
 
+    # --- Primary: Qwen3 via Ollama ---
     try:
+        return ollama_chat(
+            system=COVER_LETTER_SYSTEM,
+            user=prompt,
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            max_tokens=1024,
+        ).strip()
+    except Exception as e:
+        console.print(f"  [yellow]Ollama cover letter failed ({e}), falling back to Claude...[/yellow]")
+
+    # --- Fallback: Claude ---
+    try:
+        from job_bot.ai.client import get_client
+        client = get_client()
         with client.messages.stream(
             model=settings.cover_letter_model,
             max_tokens=1024,
@@ -58,13 +72,10 @@ Write the cover letter body now (3 paragraphs, ~250 words):"""
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             response = stream.get_final_message()
-
         for block in response.content:
             if block.type == "text":
                 return block.text.strip()
-
-        return ""
-
     except Exception as e:
-        console.print(f"  [red]Cover letter generation error: {e}[/red]")
-        return f"I am excited to apply for the {job.title} position at {job.company}."
+        console.print(f"  [red]Claude cover letter error: {e}[/red]")
+
+    return f"I am excited to apply for the {job.title} position at {job.company}."

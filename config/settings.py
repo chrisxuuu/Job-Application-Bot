@@ -50,5 +50,11 @@ class Settings(BaseSettings):
         "claude-opus-4-6", description="Model for cover letter generation"
     )
 
+    # Ollama fallback (used when Anthropic credits are exhausted)
+    ollama_base_url: str = Field(
+        "http://localhost:11434", description="Base URL for Ollama server"
+    )
+    ollama_model: str = Field("qwen3:8b", description="Ollama model to use as Claude fallback")
+
 
 settings = Settings()  # type: ignore[call-arg]

@@ -192,6 +192,89 @@ def jobs(
 
 
 @app.command()
+def apply(
+    dry_run: bool = typer.Option(False, "--dry-run/--live", help="Preview without submitting"),
+) -> None:
+    """Apply to all evaluated jobs already in the database."""
+    import asyncio
+    from config.settings import settings
+    from job_bot.storage.database import init_db
+    from job_bot.storage.repository import JobRepository
+    from job_bot.models.application import Application
+    from job_bot.ai.cover_letter import generate_cover_letter
+    from job_bot.ai.evaluator import EvaluationResult
+    from job_bot.scrapers.linkedin import LinkedInScraper
+
+    session_factory = init_db(settings.db_path)
+    session = session_factory()
+    repo = JobRepository(session)
+
+    jobs = repo.get_evaluated_jobs()
+    if not jobs:
+        console.print("[yellow]No evaluated jobs in database. Run: python cli.py run[/yellow]")
+        session.close()
+        return
+
+    console.print(f"Found [bold]{len(jobs)}[/bold] evaluated jobs to apply to.\n")
+
+    async def _run():
+        daily_count = repo.get_daily_application_count()
+        scraper = LinkedInScraper(
+            email=settings.linkedin_email,
+            password=settings.linkedin_password,
+            headless=False,
+        )
+        async with scraper:
+            await scraper.login()
+            for job in jobs:
+                if daily_count >= settings.max_applications_per_day:
+                    console.print(f"[yellow]Daily limit ({settings.max_applications_per_day}) reached.[/yellow]")
+                    break
+
+                # Rebuild EvaluationResult from stored data
+                result = EvaluationResult(
+                    score=job.fit_score or 0,
+                    reasoning=job.fit_reasoning or "",
+                    missing_requirements=list(filter(None, (job.missing_requirements or "").splitlines())),
+                    standout_qualifications=list(filter(None, (job.standout_qualifications or "").splitlines())),
+                    recommendation="apply",
+                )
+
+                console.print(f"  [{job.fit_score}] [cyan]{job.title}[/cyan] @ {job.company}")
+                cover_letter = generate_cover_letter(job, result)
+
+                if dry_run:
+                    console.print(f"  [dim][DRY RUN] Would apply[/dim]")
+                    continue
+
+                try:
+                    success = await scraper.apply_easy(job, cover_letter)
+                except Exception as e:
+                    console.print(f"  [red]Error: {e}[/red]")
+                    success = False
+
+                application = Application(
+                    job_id=job.id,
+                    cover_letter=cover_letter,
+                    method="easy_apply_or_external",
+                    success=success,
+                    error_message=None if success else "Apply flow did not complete",
+                )
+                repo.save_application(application)
+
+                if success:
+                    repo.update_job_status(job.id, "applied")
+                    daily_count += 1
+                    console.print(f"  [green]✓ Applied[/green]")
+                else:
+                    repo.update_job_status(job.id, "manual_review")
+                    console.print(f"  [yellow]✗ Failed — moved to manual review[/yellow]")
+
+    asyncio.run(_run())
+    session.close()
+
+
+@app.command()
 def schedule(
     hour: int = typer.Option(8, "--hour", help="Hour of day to run (24h format)"),
     minute: int = typer.Option(0, "--minute", help="Minute of hour to run"),

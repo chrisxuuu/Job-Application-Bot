@@ -136,60 +136,59 @@ async def run_pipeline(
         console.rule("[bold blue]Applying to jobs[/bold blue]")
         daily_count = repo.get_daily_application_count()
 
-        for job, cover_letter in jobs_to_apply:
-            if daily_count >= settings.max_applications_per_day:
-                console.print(
-                    f"[yellow]Daily limit ({settings.max_applications_per_day}) reached.[/yellow]"
-                )
-                repo.update_job_status(job.id, "manual_review")
-                summary["manual_review"] += 1
-                continue
-
-            if dry_run:
+        if dry_run:
+            for job, cover_letter in jobs_to_apply:
                 console.print(
                     f"  [dim][DRY RUN][/dim] Would apply to: "
                     f"[cyan]{job.title}[/cyan] @ {job.company}"
                 )
                 summary["applied"] += 1
-                continue
-
-            success = await _apply_to_job(job, cover_letter)
-            application = Application(
-                job_id=job.id,
-                cover_letter=cover_letter,
-                method="easy_apply",
-                success=success,
-                error_message=None if success else "Apply flow did not complete",
+        else:
+            # Open ONE browser session for all applications to avoid profile lock conflicts
+            from job_bot.scrapers.linkedin import LinkedInScraper
+            scraper = LinkedInScraper(
+                email=settings.linkedin_email,
+                password=settings.linkedin_password,
+                headless=False,
             )
-            repo.save_application(application)
+            async with scraper:
+                await scraper.login()
+                for job, cover_letter in jobs_to_apply:
+                    if daily_count >= settings.max_applications_per_day:
+                        console.print(
+                            f"[yellow]Daily limit ({settings.max_applications_per_day}) reached.[/yellow]"
+                        )
+                        repo.update_job_status(job.id, "manual_review")
+                        summary["manual_review"] += 1
+                        continue
 
-            if success:
-                repo.update_job_status(job.id, "applied")
-                summary["applied"] += 1
-                daily_count += 1
-            else:
-                repo.update_job_status(job.id, "manual_review")
-                summary["manual_review"] += 1
+                    try:
+                        success = await scraper.apply_easy(job, cover_letter)
+                    except Exception as e:
+                        console.print(f"  [red]Apply error: {e}[/red]")
+                        success = False
+
+                    application = Application(
+                        job_id=job.id,
+                        cover_letter=cover_letter,
+                        method="easy_apply_or_external",
+                        success=success,
+                        error_message=None if success else "Apply flow did not complete",
+                    )
+                    repo.save_application(application)
+
+                    if success:
+                        repo.update_job_status(job.id, "applied")
+                        summary["applied"] += 1
+                        daily_count += 1
+                    else:
+                        repo.update_job_status(job.id, "manual_review")
+                        summary["manual_review"] += 1
 
     _print_summary(summary, dry_run)
     session.close()
     return summary
 
-
-async def _apply_to_job(job: Job, cover_letter: str) -> bool:
-    try:
-        from job_bot.scrapers.linkedin import LinkedInScraper
-        scraper = LinkedInScraper(
-            email=settings.linkedin_email,
-            password=settings.linkedin_password,
-            headless=False,
-        )
-        async with scraper:
-            await scraper.login()
-            return await scraper.apply_easy(job, cover_letter)
-    except Exception as e:
-        console.print(f"  [red]Apply error: {e}[/red]")
-        return False
 
 
 def _print_summary(summary: dict, dry_run: bool) -> None:

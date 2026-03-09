@@ -100,6 +100,15 @@ class JobRepository:
             .all()
         )
 
+    def get_evaluated_jobs(self) -> list[Job]:
+        """Return jobs scored and ready to apply, highest score first."""
+        return (
+            self.session.query(Job)
+            .filter_by(status="evaluated")
+            .order_by(Job.fit_score.desc())
+            .all()
+        )
+
     def get_all_jobs(self, limit: int = 100) -> list[Job]:
         return (
             self.session.query(Job)

@@ -197,9 +197,9 @@ class LinkedInScraper(BaseScraper):
             company_el = await card.query_selector(".artdeco-entity-lockup__subtitle, .job-card-container__primary-description")
             location_el = await card.query_selector(".artdeco-entity-lockup__caption, .job-card-container__metadata-item")
 
-            title = (await title_el.inner_text()).strip() if title_el else "Unknown"
-            company = (await company_el.inner_text()).strip() if company_el else "Unknown"
-            location = (await location_el.inner_text()).strip() if location_el else None
+            title = (await title_el.inner_text()).strip().splitlines()[0].strip() if title_el else "Unknown"
+            company = (await company_el.inner_text()).strip().splitlines()[0].strip() if company_el else "Unknown"
+            location = (await location_el.inner_text()).strip().splitlines()[0].strip() if location_el else None
 
             return Job(
                 source="linkedin",
@@ -261,40 +261,137 @@ class LinkedInScraper(BaseScraper):
             console.print(f"  [yellow]Could not fetch detail for {job.external_id}: {e}[/yellow]")
         return job
 
+    async def _find_apply_button(self, page):
+        """
+        Find the Apply / Easy Apply button on the current page.
+        Tries multiple selector strategies to handle LinkedIn DOM changes.
+        Returns (element, button_text) or (None, '').
+        """
+        strategies = [
+            # Text-based (most resilient to DOM changes)
+            "button:has-text('Easy Apply')",
+            "button:has-text('Apply now')",
+            "button:has-text('Apply')",
+            # Class-based (LinkedIn-specific)
+            "button.jobs-apply-button",
+            ".jobs-apply-button--top-card button",
+            ".jobs-s-apply button",
+            # Aria-label
+            "button[aria-label*='Easy Apply']",
+            "button[aria-label*='Apply to']",
+            "button[aria-label*='apply']",
+            # Data attribute
+            "button[data-control-name*='apply']",
+        ]
+        for sel in strategies:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    text = (await el.inner_text()).strip().lower()
+                    return el, text
+            except Exception:
+                continue
+        return None, ""
+
     async def apply_easy(self, job: Job, cover_letter: str) -> bool:
         """
-        Attempt LinkedIn Easy Apply flow.
+        Attempt LinkedIn Easy Apply flow. Falls back to external apply via AI form-filler.
         Returns True if the application was submitted successfully.
         """
         from playwright.async_api import TimeoutError as PlaywrightTimeout
         page = self._page
 
         try:
-            await page.goto(job.url)
-            await self._delay()
+            # Try direct job URL first; fall back to search panel URL if button not found
+            for nav_url in [job.url, f"https://www.linkedin.com/jobs/search/?currentJobId={job.external_id}"]:
+                await page.goto(nav_url)
+                await self._delay()
+                try:
+                    await page.wait_for_selector(
+                        "button:has-text('Easy Apply'), button:has-text('Apply'), button.jobs-apply-button",
+                        timeout=8000,
+                    )
+                except Exception:
+                    pass
+                apply_btn, btn_text = await self._find_apply_button(page)
+                if apply_btn:
+                    console.print(f"  [dim]Found apply button via {nav_url} → '{btn_text}'[/dim]")
+                    break
 
-            # Click Easy Apply button
-            easy_apply_btn = await page.query_selector(
-                "button.jobs-apply-button, .jobs-apply-button--top-card button"
-            )
-            if not easy_apply_btn:
-                console.print(f"  [yellow]Easy Apply button not found for {job.url}[/yellow]")
+            if not apply_btn:
+                all_btns = await page.query_selector_all("button")
+                labels = []
+                for b in all_btns[:15]:
+                    try:
+                        txt = (await b.inner_text()).strip()[:50]
+                        aria = await b.get_attribute("aria-label") or ""
+                        if txt or aria:
+                            labels.append(repr(txt or aria))
+                    except Exception:
+                        pass
+                console.print(
+                    f"  [yellow]No apply button found for {job.external_id}. "
+                    f"Buttons on page: {', '.join(labels) or 'none'}[/yellow]"
+                )
                 return False
 
-            await easy_apply_btn.hover()
+            # External apply — button text doesn't say "easy apply"
+            if "easy" not in btn_text:
+                console.print(f"  [cyan]External apply button ('{btn_text}') — launching form filler...[/cyan]")
+                return await self._try_external_apply(page, apply_btn, job, cover_letter)
+
+            # --- Easy Apply modal flow ---
+            console.print(f"  [green]Easy Apply found — clicking...[/green]")
+            await apply_btn.hover()
             await asyncio.sleep(0.3)
-            await easy_apply_btn.click()
+            await apply_btn.click()
             await asyncio.sleep(2)
 
-            # Walk through the modal wizard
-            max_steps = 10
+            # Verify modal opened
+            modal = await page.query_selector(".jobs-easy-apply-modal, [data-test-modal]")
+            if not modal:
+                console.print(f"  [yellow]Easy Apply modal did not open after click[/yellow]")
+                return False
+
+            console.print(f"  [dim]Modal opened — walking steps...[/dim]")
+
+            max_steps = 15
+            prev_btn_signature = ""
+            stuck_count = 0
             for step in range(max_steps):
-                # Check if we reached the submit/review step
-                submit_btn = await page.query_selector(
-                    "button[aria-label='Submit application'], button[data-control-name='submit_unify']"
+                await asyncio.sleep(0.5)
+
+                # Dump current modal buttons for diagnostics
+                modal_btns = await page.query_selector_all(
+                    ".jobs-easy-apply-modal button, [data-test-modal] button"
                 )
-                if submit_btn:
-                    # Take screenshot before submitting
+                btn_texts = []
+                for b in modal_btns:
+                    try:
+                        t = (await b.inner_text()).strip()
+                        a = await b.get_attribute("aria-label") or ""
+                        btn_texts.append(repr(t or a))
+                    except Exception:
+                        pass
+                btn_signature = "|".join(btn_texts)
+                console.print(f"  [dim]Step {step} buttons: {', '.join(btn_texts)}[/dim]")
+
+                # Stuck detection: same buttons twice in a row means a required field is blocking
+                if btn_signature == prev_btn_signature:
+                    stuck_count += 1
+                    if stuck_count >= 2:
+                        console.print(f"  [yellow]Stuck on step {step} — required field likely blocking[/yellow]")
+                        break
+                else:
+                    stuck_count = 0
+                prev_btn_signature = btn_signature
+
+                # Submit button (final step)
+                submit_btn = await page.query_selector(
+                    "button[aria-label='Submit application'], "
+                    "button[data-control-name='submit_unify']"
+                )
+                if submit_btn and await submit_btn.is_visible():
                     from config.settings import settings
                     import os
                     os.makedirs(settings.screenshots_dir, exist_ok=True)
@@ -302,29 +399,42 @@ class LinkedInScraper(BaseScraper):
                         f"{settings.screenshots_dir}/{job.source}_{job.external_id}_pre_submit.png"
                     )
                     await page.screenshot(path=screenshot_path)
-                    console.print(f"  [cyan]Screenshot saved: {screenshot_path}[/cyan]")
-
+                    console.print(f"  [cyan]Screenshot: {screenshot_path}[/cyan]")
                     await submit_btn.click()
                     await asyncio.sleep(2)
-                    console.print(f"  [green]Applied to {job.title} @ {job.company}[/green]")
+                    console.print(f"  [green]✓ Applied: {job.title} @ {job.company}[/green]")
                     return True
 
-                # Handle screening questions
+                # Fill fields on this step
                 await self._handle_easy_apply_step(page, cover_letter)
 
-                # Click Next button
-                next_btn = await page.query_selector(
-                    "button[aria-label='Continue to next step'], "
-                    "button[aria-label='Review your application']"
-                )
+                # Next / Review / Continue buttons (order matters — most specific first)
+                next_btn = None
+                for next_sel in [
+                    "button[aria-label='Continue to next step']",
+                    "button[aria-label='Review your application']",
+                    "button:has-text('Review')",
+                    "button:has-text('Next')",
+                    "button:has-text('Continue')",
+                ]:
+                    try:
+                        el = await page.query_selector(next_sel)
+                        if el and await el.is_visible():
+                            next_btn = el
+                            break
+                    except Exception:
+                        continue
+
                 if not next_btn:
-                    console.print(f"  [yellow]No Next button found at step {step}[/yellow]")
+                    console.print(f"  [yellow]No Next/Continue button at step {step} — stopping[/yellow]")
                     break
 
+                next_text = (await next_btn.inner_text()).strip()
+                console.print(f"  [dim]Clicking: '{next_text}'[/dim]")
                 await next_btn.click()
                 await asyncio.sleep(1.5)
 
-            console.print(f"  [yellow]Easy Apply: max steps reached without submit[/yellow]")
+            console.print(f"  [yellow]Easy Apply: did not reach submit after {max_steps} steps[/yellow]")
             return False
 
         except PlaywrightTimeout:
@@ -334,27 +444,517 @@ class LinkedInScraper(BaseScraper):
             console.print(f"  [red]Easy Apply error for {job.url}: {e}[/red]")
             return False
 
+    async def _try_external_apply(self, page, apply_btn, job: Job, cover_letter: str) -> bool:
+        """
+        Click the external Apply button, handle LinkedIn's 'leaving' confirmation modal,
+        then use Qwen3 to fill and submit the employer's application form.
+        """
+        from job_bot.applicator.external_apply import apply_on_external_site
+
+        new_page = None
+        pages_before = set(id(p) for p in page.context.pages)
+
+        # Click the Apply button
+        await apply_btn.click()
+        await asyncio.sleep(1.5)
+
+        # Dismiss the "You're leaving LinkedIn" modal if it appears
+        for selector in [
+            "button[aria-label='Continue to apply']",
+            "button:has-text('Continue to apply')",
+            "button:has-text('Apply now')",
+            ".artdeco-modal button.artdeco-button--primary",
+        ]:
+            try:
+                modal_btn = await page.wait_for_selector(selector, timeout=3000)
+                if modal_btn and await modal_btn.is_visible():
+                    console.print(f"  [dim]Dismissing 'leaving LinkedIn' modal...[/dim]")
+                    await modal_btn.click()
+                    break
+            except Exception:
+                continue
+
+        # Wait up to 10s for a new tab to appear
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            new_tabs = [p for p in page.context.pages if id(p) not in pages_before]
+            if new_tabs:
+                new_page = new_tabs[-1]
+                break
+
+        if new_page:
+            try:
+                await new_page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            console.print(f"  [cyan]External page (new tab): {new_page.url}[/cyan]")
+        elif "linkedin.com" not in page.url:
+            # Same-tab navigation
+            new_page = page
+            console.print(f"  [cyan]External page (same tab): {page.url}[/cyan]")
+        else:
+            console.print(f"  [yellow]External apply: no new page detected after clicking Apply[/yellow]")
+            return False
+
+        try:
+            result = await apply_on_external_site(new_page, job, cover_letter)
+        except Exception as e:
+            console.print(f"  [red]External apply error: {e}[/red]")
+            result = False
+        finally:
+            if new_page is not None and new_page is not page:
+                await new_page.close()
+
+        return result
+
+    async def _get_field_label(self, page, element) -> str:
+        """Return the best human-readable label for a form element."""
+        try:
+            el_id = await element.get_attribute("id") or ""
+            if el_id:
+                lbl = await page.query_selector(f'label[for="{el_id}"]')
+                if lbl:
+                    return (await lbl.inner_text()).strip()
+            aria = await element.get_attribute("aria-label") or ""
+            if aria:
+                return aria.strip()
+            ph = await element.get_attribute("placeholder") or ""
+            if ph:
+                return ph.strip()
+            return await element.evaluate(
+                """el => {
+                    let p = el.parentElement;
+                    while (p && !['LABEL','FIELDSET','FORM'].includes(p.tagName))
+                        p = p.parentElement;
+                    return (p && p.tagName === 'LABEL') ? p.innerText.trim() : '';
+                }"""
+            )
+        except Exception:
+            return ""
+
+    async def _fill_add_section(self, page, scope, section_type: str, data: dict) -> None:
+        """
+        Click an 'Add education' or 'Add experience' button, fill the sub-form,
+        then click Save to confirm the entry.
+        """
+        # Find the Add button for this section type
+        keywords = {
+            "education": ["add education", "add school"],
+            "experience": ["add experience", "add work experience", "add position"],
+        }.get(section_type, [])
+
+        add_btn = None
+        for btn in await scope.query_selector_all("button"):
+            if not await btn.is_visible():
+                continue
+            txt = (await btn.inner_text()).strip().lower()
+            if any(kw in txt for kw in keywords):
+                add_btn = btn
+                break
+
+        if not add_btn:
+            return
+
+        console.print(f"  [dim]Expanding '{section_type}' sub-form...[/dim]")
+        await add_btn.click()
+        await asyncio.sleep(1.5)
+
+        # --- Fill sub-form fields directly from structured data ---
+        month_map = {
+            "January": "1", "February": "2", "March": "3", "April": "4",
+            "May": "5", "June": "6", "July": "7", "August": "8",
+            "September": "9", "October": "10", "November": "11", "December": "12",
+        }
+
+        async def _try_fill(selectors: list[str], value: str) -> bool:
+            for sel in selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el and await el.is_visible():
+                        tag = await el.evaluate("e => e.tagName.toLowerCase()")
+                        if tag == "select":
+                            try:
+                                await el.select_option(label=value)
+                            except Exception:
+                                # Try partial match on option text
+                                opts = await el.query_selector_all("option")
+                                for o in opts:
+                                    ot = (await o.inner_text()).strip()
+                                    if value.lower() in ot.lower() or ot.lower() in value.lower():
+                                        await el.select_option(value=await o.get_attribute("value") or ot)
+                                        break
+                        else:
+                            await el.click(click_count=3)
+                            await el.fill(value)
+                        await asyncio.sleep(0.3)
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        if section_type == "education":
+            await _try_fill(
+                ["input[id*='school'], input[aria-label*='school'], input[aria-label*='School'], "
+                 "input[placeholder*='school'], input[placeholder*='School']".split(", ")],
+                data.get("school", ""),
+            )
+            # Wait for autocomplete to appear and dismiss it
+            await asyncio.sleep(1.0)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+
+            degree_val = data.get("degree", "")
+            await _try_fill(
+                ["select[id*='degree'], select[aria-label*='degree'], select[aria-label*='Degree']"],
+                degree_val,
+            )
+            await _try_fill(
+                ["input[id*='field'], input[aria-label*='field of study'], input[placeholder*='field']"],
+                data.get("field_of_study", ""),
+            )
+            # Start date
+            if data.get("start_month"):
+                await _try_fill(
+                    ["select[id*='start'][id*='month'], select[aria-label*='Start Month']"],
+                    data["start_month"],
+                )
+                await _try_fill(
+                    ["select[id*='start'][id*='year'], input[id*='start'][id*='year'], select[aria-label*='Start Year']"],
+                    data.get("start_year", ""),
+                )
+            # End date
+            if data.get("end_month"):
+                await _try_fill(
+                    ["select[id*='end'][id*='month'], select[aria-label*='End Month']"],
+                    data["end_month"],
+                )
+                await _try_fill(
+                    ["select[id*='end'][id*='year'], input[id*='end'][id*='year'], select[aria-label*='End Year']"],
+                    data.get("end_year", ""),
+                )
+            if data.get("gpa"):
+                await _try_fill(
+                    ["input[id*='gpa'], input[aria-label*='gpa'], input[aria-label*='GPA']"],
+                    data["gpa"],
+                )
+
+        elif section_type == "experience":
+            await _try_fill(
+                ["input[id*='title'], input[aria-label*='Title'], input[aria-label*='title'], input[placeholder*='Title']"],
+                data.get("title", ""),
+            )
+            await _try_fill(
+                ["input[id*='company'], input[aria-label*='Company'], input[placeholder*='Company']"],
+                data.get("company", ""),
+            )
+            await asyncio.sleep(1.0)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+
+            if data.get("employment_type"):
+                await _try_fill(
+                    ["select[id*='employment'], select[aria-label*='Employment']"],
+                    data["employment_type"],
+                )
+            await _try_fill(
+                ["input[id*='location'], input[aria-label*='Location'], input[placeholder*='Location']"],
+                data.get("location", ""),
+            )
+            await asyncio.sleep(0.5)
+            await page.keyboard.press("Escape")
+
+            # Currently working checkbox
+            if data.get("currently_working"):
+                for sel in ["input[id*='current'], input[aria-label*='currently working']"]:
+                    try:
+                        el = await page.query_selector(sel)
+                        if el and not await el.is_checked():
+                            await el.check()
+                            break
+                    except Exception:
+                        pass
+
+            if data.get("start_month"):
+                await _try_fill(
+                    ["select[id*='start'][id*='month'], select[aria-label*='Start Month']"],
+                    data["start_month"],
+                )
+                await _try_fill(
+                    ["select[id*='start'][id*='year'], input[id*='start'][id*='year']"],
+                    data.get("start_year", ""),
+                )
+            if not data.get("currently_working") and data.get("end_month"):
+                await _try_fill(
+                    ["select[id*='end'][id*='month'], select[aria-label*='End Month']"],
+                    data["end_month"],
+                )
+                await _try_fill(
+                    ["select[id*='end'][id*='year'], input[id*='end'][id*='year']"],
+                    data.get("end_year", ""),
+                )
+            if data.get("description"):
+                await _try_fill(
+                    ["textarea[id*='description'], textarea[aria-label*='Description']"],
+                    data["description"],
+                )
+
+        # Click Save button in the sub-form
+        for save_sel in [
+            "button[aria-label='Save']",
+            "button:has-text('Save')",
+            "button[data-easy-apply-next-button]",
+        ]:
+            try:
+                save_btn = await page.query_selector(save_sel)
+                if save_btn and await save_btn.is_visible():
+                    console.print(f"  [dim]Saving '{section_type}' entry...[/dim]")
+                    await save_btn.click()
+                    await asyncio.sleep(1.5)
+                    break
+            except Exception:
+                continue
+
     async def _handle_easy_apply_step(self, page, cover_letter: str) -> None:
-        """Fill in form fields on the current Easy Apply step."""
-        # Cover letter text area
-        cover_letter_el = await page.query_selector(
-            "textarea[id*='cover-letter'], textarea[placeholder*='cover letter']"
+        """
+        Fill all visible form fields on the current Easy Apply modal step.
+        Uses Qwen3 to answer screening questions based on the candidate profile.
+        """
+        import json
+        import yaml
+        from config.settings import settings
+        from pathlib import Path
+        from job_bot.ai.ollama_client import ollama_chat
+
+        modal = await page.query_selector(".jobs-easy-apply-modal, [data-test-modal]")
+        scope = modal if modal else page
+
+        # --- 0. Handle 'Add education / experience' sections first ---
+        try:
+            profile_data: dict = {}
+            with open(settings.profile_path) as pf:
+                profile_data = yaml.safe_load(pf) or {}
+
+            edu_list = profile_data.get("education", [])
+            exp_list = profile_data.get("experience", [])
+
+            for btn in await scope.query_selector_all("button"):
+                if not await btn.is_visible():
+                    continue
+                txt = (await btn.inner_text()).strip().lower()
+                if "add" in txt and "education" in txt and edu_list:
+                    await self._fill_add_section(page, scope, "education", edu_list[0])
+                elif "add" in txt and any(kw in txt for kw in ("experience", "work", "position")) and exp_list:
+                    await self._fill_add_section(page, scope, "experience", exp_list[0])
+        except Exception as e:
+            console.print(f"  [yellow]Add-section handling failed: {e}[/yellow]")
+
+        # --- 1. Cover letter textarea ---
+        for cl_sel in [
+            "textarea[id*='cover-letter']",
+            "textarea[placeholder*='cover letter']",
+            "textarea[placeholder*='Cover letter']",
+        ]:
+            el = await scope.query_selector(cl_sel)
+            if el and await el.is_visible():
+                await el.fill(cover_letter[:3000])
+                break
+
+        # --- 2. Collect all unfilled visible fields ---
+        fields = []  # list of dicts with keys: kind, label, id, name, element, options
+
+        # Text / number / email / tel / url inputs and textareas
+        for inp in await scope.query_selector_all(
+            "input[type='text'], input[type='number'], input[type='tel'], "
+            "input[type='email'], input[type='url'], textarea"
+        ):
+            try:
+                if not await inp.is_visible():
+                    continue
+                if await inp.input_value():
+                    continue  # already filled
+                label = await self._get_field_label(page, inp)
+                inp_type = await inp.get_attribute("type") or "text"
+                fields.append({
+                    "kind": "input",
+                    "type": inp_type,
+                    "label": label,
+                    "id": await inp.get_attribute("id") or "",
+                    "name": await inp.get_attribute("name") or "",
+                    "element": inp,
+                })
+            except Exception:
+                continue
+
+        # Radio groups
+        for group in await scope.query_selector_all(
+            ".jobs-easy-apply-form-section__grouping, fieldset"
+        ):
+            try:
+                if await group.query_selector("input[type='radio']:checked"):
+                    continue  # already answered
+                radios = await group.query_selector_all("input[type='radio']")
+                if not radios:
+                    continue
+                lbl_el = await group.query_selector(
+                    "legend, .fb-form-element-label, .jobs-easy-apply-form-element__label"
+                )
+                question = (await lbl_el.inner_text()).strip() if lbl_el else ""
+                options = []
+                for r in radios:
+                    r_id = await r.get_attribute("id") or ""
+                    lbl = await page.query_selector(f'label[for="{r_id}"]') if r_id else None
+                    lbl_text = (await lbl.inner_text()).strip() if lbl else (await r.get_attribute("value") or "")
+                    options.append({
+                        "label": lbl_text,
+                        "value": await r.get_attribute("value") or "",
+                        "element": r,
+                        "label_element": lbl,  # label is clickable; input may be CSS-hidden
+                    })
+                fields.append({"kind": "radio", "label": question, "options": options})
+            except Exception:
+                continue
+
+        # Select dropdowns
+        for sel_el in await scope.query_selector_all("select"):
+            try:
+                if not await sel_el.is_visible():
+                    continue
+                label = await self._get_field_label(page, sel_el)
+                opts = [(await o.inner_text()).strip() for o in await sel_el.query_selector_all("option")]
+                fields.append({
+                    "kind": "select",
+                    "label": label,
+                    "id": await sel_el.get_attribute("id") or "",
+                    "name": await sel_el.get_attribute("name") or "",
+                    "options": opts,
+                    "element": sel_el,
+                })
+            except Exception:
+                continue
+
+        if not fields:
+            return
+
+        # --- 3. Ask Qwen3 to answer each field ---
+        profile_text = Path(settings.profile_path).read_text() if Path(settings.profile_path).exists() else ""
+        resume_text = Path(settings.resume_path).read_text() if Path(settings.resume_path).exists() else ""
+
+        fields_info = []
+        for f in fields:
+            info: dict = {"label": f["label"], "type": f.get("type", f["kind"])}
+            if f["kind"] in ("radio", "select"):
+                info["options"] = [o["label"] if isinstance(o, dict) else o for o in f["options"]]
+            fields_info.append(info)
+
+        system_prompt = (
+            "You are filling out a LinkedIn Easy Apply screening form for a job candidate.\n"
+            "Given the form fields below, return a JSON array with one object per field.\n"
+            'Each object: {"label": "<exact field label>", "answer": "<your answer>"}\n'
+            "Rules:\n"
+            "- Work authorization / legally authorized to work → Yes\n"
+            "- Require sponsorship / visa sponsorship → No\n"
+            "- For radios/selects pick an exact option from the provided list\n"
+            "- For salary fields return a whole integer only (e.g. 105000), no symbols, no decimals, no ranges\n"
+            "- Use the candidate profile/resume for all other answers\n"
+            "- Return ONLY a valid JSON array, no explanation or markdown"
         )
-        if cover_letter_el:
-            await cover_letter_el.fill(cover_letter[:3000])  # LinkedIn has a char limit
+        user_prompt = (
+            f"Form fields:\n{json.dumps(fields_info, indent=2)}\n\n"
+            f"Candidate Profile:\n{profile_text[:1500]}\n\n"
+            f"Candidate Resume:\n{resume_text[:2000]}\n\n"
+            "Return JSON array of answers:"
+        )
 
-        # Handle yes/no radio questions (answer "Yes" by default where applicable)
-        radio_groups = await page.query_selector_all(".jobs-easy-apply-form-section__grouping")
-        for group in radio_groups:
-            yes_radio = await group.query_selector("input[type='radio'][value='Yes']")
-            if yes_radio:
-                await yes_radio.check()
+        answer_map: dict = {}
+        try:
+            raw = ollama_chat(
+                system=system_prompt,
+                user=user_prompt,
+                model=settings.ollama_model,
+                base_url=settings.ollama_base_url,
+                max_tokens=512,
+            )
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            answers = json.loads(raw.strip())
+            answer_map = {a["label"].strip().lower(): str(a["answer"]) for a in answers}
+            console.print(f"  [dim]AI answers: {answer_map}[/dim]")
+        except Exception as e:
+            console.print(f"  [yellow]AI field-fill failed ({e}) — using defaults[/yellow]")
 
-        # Handle numeric inputs for years of experience
-        number_inputs = await page.query_selector_all("input[type='number']")
-        for inp in number_inputs:
-            label = await inp.get_attribute("aria-label") or ""
-            if "year" in label.lower() or "experience" in label.lower():
-                current_val = await inp.input_value()
-                if not current_val:
-                    await inp.fill("3")  # Default to 3 years; override in profile.yaml
+        # --- 4. Apply answers ---
+        for f in fields:
+            key = f["label"].strip().lower()
+            answer = answer_map.get(key, "")
+
+            if f["kind"] == "input":
+                if not answer:
+                    lbl = f["label"].lower()
+                    if "year" in lbl or "experience" in lbl:
+                        answer = "3"
+                    else:
+                        continue
+                # For number inputs, strip any non-numeric characters Qwen may have added
+                if f.get("type") == "number":
+                    import re as _re
+                    answer = _re.sub(r"[^\d]", "", str(answer))
+                try:
+                    await f["element"].click(click_count=3)
+                    await f["element"].fill(str(answer))
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    console.print(f"  [dim]Could not fill '{f['label']}': {e}[/dim]")
+
+            elif f["kind"] == "radio":
+                ans_lower = answer.lower()
+
+                # Find the best matching option, then fall back to Yes / first
+                target_opt = None
+                for opt in f["options"]:
+                    if opt["label"].lower() == ans_lower or opt["value"].lower() == ans_lower:
+                        target_opt = opt
+                        break
+                if not target_opt:
+                    for opt in f["options"]:
+                        if opt["label"].lower() in ("yes", "y"):
+                            target_opt = opt
+                            break
+                if not target_opt and f["options"]:
+                    target_opt = f["options"][0]
+
+                if target_opt:
+                    # LinkedIn hides the <input> via CSS — clicking the <label> is required
+                    async def _click_radio(opt):
+                        if opt.get("label_element"):
+                            try:
+                                await opt["label_element"].click()
+                                return
+                            except Exception:
+                                pass
+                        # Fallback: click the input directly or use check()
+                        try:
+                            await opt["element"].click()
+                        except Exception:
+                            try:
+                                await opt["element"].check()
+                            except Exception as e:
+                                console.print(f"  [dim]Radio click failed '{f['label']}': {e}[/dim]")
+
+                    await _click_radio(target_opt)
+                    await asyncio.sleep(0.3)
+                    console.print(f"  [dim]Radio '{f['label']}' → '{target_opt['label']}'[/dim]")
+
+            elif f["kind"] == "select":
+                if not answer:
+                    continue
+                try:
+                    try:
+                        await f["element"].select_option(label=answer)
+                    except Exception:
+                        await f["element"].select_option(value=answer)
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    console.print(f"  [dim]Select failed '{f['label']}': {e}[/dim]")

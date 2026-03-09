@@ -7,7 +7,7 @@ from typing import Literal
 
 from rich.console import Console
 
-from job_bot.ai.client import get_client
+from job_bot.ai.ollama_client import ollama_chat
 from job_bot.models.job import Job
 
 console = Console()
@@ -67,18 +67,29 @@ has but might be able to justify in an interview.
 """
 
 
+def _parse_json_result(raw: str) -> EvaluationResult:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    data = json.loads(raw)
+    return EvaluationResult(
+        score=int(data.get("score", 0)),
+        reasoning=data.get("reasoning", ""),
+        missing_requirements=data.get("missing_requirements", []),
+        standout_qualifications=data.get("standout_qualifications", []),
+        recommendation=data.get("recommendation", "skip"),
+    )
+
+
 def evaluate_job(job: Job) -> EvaluationResult:
-    """
-    Ask Claude to score how well the candidate fits this job.
-    Uses prompt caching on the system message (resume + profile) to reduce costs.
-    """
-    client = get_client()
+    """Score how well the candidate fits this job. Uses Qwen3 (Ollama) as primary, Claude as fallback."""
     from config.settings import settings
 
     resume, profile = _load_resume_and_profile()
-
     system_content = SYSTEM_PROMPT_TEMPLATE.format(resume=resume, profile=profile)
-
     job_content = f"""
 Job Title: {job.title}
 Company: {job.company}
@@ -88,68 +99,44 @@ URL: {job.url}
 Job Description:
 {job.description or 'No description available.'}
 """
+    user_msg = f"Please evaluate this job opportunity and return JSON only:\n{job_content}"
 
+    # --- Primary: Qwen3 via Ollama ---
     try:
+        raw = ollama_chat(
+            system=system_content,
+            user=user_msg,
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            max_tokens=1024,
+        )
+        return _parse_json_result(raw)
+    except Exception as e:
+        console.print(f"  [yellow]Ollama evaluator failed ({e}), falling back to Claude...[/yellow]")
+
+    # --- Fallback: Claude ---
+    try:
+        from job_bot.ai.client import get_client
+        client = get_client()
         with client.messages.stream(
             model=settings.evaluator_model,
             max_tokens=1024,
             thinking={"type": "adaptive"},
-            system=[
-                {
-                    "type": "text",
-                    "text": system_content,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Please evaluate this job opportunity and return JSON only:\n{job_content}"
-                    ),
-                }
-            ],
+            system=[{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": user_msg}],
         ) as stream:
             response = stream.get_final_message()
-
-        raw = ""
-        for block in response.content:
-            if block.type == "text":
-                raw = block.text
-                break
-
-        # Strip markdown code fences if present
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        data = json.loads(raw)
-        return EvaluationResult(
-            score=int(data.get("score", 0)),
-            reasoning=data.get("reasoning", ""),
-            missing_requirements=data.get("missing_requirements", []),
-            standout_qualifications=data.get("standout_qualifications", []),
-            recommendation=data.get("recommendation", "skip"),
-        )
-
+        raw = next((b.text for b in response.content if b.type == "text"), "")
+        return _parse_json_result(raw)
     except json.JSONDecodeError as e:
         console.print(f"  [red]Evaluator JSON parse error: {e}[/red]")
-        return EvaluationResult(
-            score=0,
-            reasoning="Failed to parse evaluation response.",
-            missing_requirements=[],
-            standout_qualifications=[],
-            recommendation="manual_review",
-        )
     except Exception as e:
-        console.print(f"  [red]Evaluator error: {e}[/red]")
-        return EvaluationResult(
-            score=0,
-            reasoning=f"Evaluation error: {e}",
-            missing_requirements=[],
-            standout_qualifications=[],
-            recommendation="manual_review",
-        )
+        console.print(f"  [red]Claude evaluator error: {e}[/red]")
+
+    return EvaluationResult(
+        score=0,
+        reasoning="All evaluators failed.",
+        missing_requirements=[],
+        standout_qualifications=[],
+        recommendation="manual_review",
+    )
