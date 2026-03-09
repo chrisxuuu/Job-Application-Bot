@@ -44,17 +44,17 @@ class Settings(BaseSettings):
     request_delay_min: float = Field(2.0, description="Min seconds between page loads")
     request_delay_max: float = Field(7.0, description="Max seconds between page loads")
 
-    # AI model config
-    evaluator_model: str = Field("claude-opus-4-6", description="Model for job fit evaluation")
-    cover_letter_model: str = Field(
-        "claude-opus-4-6", description="Model for cover letter generation"
-    )
-
-    # Ollama fallback (used when Anthropic credits are exhausted)
+    # Ollama (primary AI)
     ollama_base_url: str = Field(
-        "http://localhost:11434", description="Base URL for Ollama server"
+        "http://localhost:11434", description="Base URL for Ollama server (primary AI)"
     )
-    ollama_model: str = Field("qwen3:8b", description="Ollama model to use as Claude fallback")
+    ollama_model: str = Field("qwen3:8b", description="Ollama model to use as primary AI")
+
+    # Claude fallback (used when Ollama is unavailable)
+    evaluator_model: str = Field("claude-opus-4-6", description="Claude fallback model for job fit evaluation")
+    cover_letter_model: str = Field(
+        "claude-opus-4-6", description="Claude fallback model for cover letter generation"
+    )
 
 
 settings = Settings()  # type: ignore[call-arg]
