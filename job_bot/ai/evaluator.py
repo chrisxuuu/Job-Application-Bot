@@ -67,14 +67,65 @@ has but might be able to justify in an interview.
 """
 
 
+def _repair_and_parse(raw: str) -> dict:
+    """
+    Best-effort JSON repair for Qwen3.5 output, which sometimes produces:
+    - Markdown fences (```json ... ```)
+    - Single quotes instead of double quotes
+    - Trailing commas before } or ]
+    - Extra text before/after the JSON object
+    Raises json.JSONDecodeError if all attempts fail.
+    """
+    import re
+
+    s = raw.strip()
+
+    # Strip markdown fences
+    if s.startswith("```"):
+        parts = s.split("```")
+        # Take the first fenced block (index 1)
+        s = parts[1] if len(parts) > 1 else s
+        if s.startswith("json"):
+            s = s[4:]
+        s = s.strip()
+
+    # Try as-is first
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # Extract the first {...} block (handles leading/trailing prose)
+    match = re.search(r"\{[\s\S]*\}", s)
+    if match:
+        s = match.group(0)
+
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # Remove trailing commas before } or ]
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # Replace single-quoted strings with double-quoted (simple heuristic)
+    s = re.sub(r"(?<![\\])'", '"', s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: remove trailing commas again after quote fix
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return json.loads(s)  # raise if still broken
+
+
 def _parse_json_result(raw: str) -> EvaluationResult:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-    data = json.loads(raw)
+    data = _repair_and_parse(raw)
     return EvaluationResult(
         score=int(data.get("score", 0)),
         reasoning=data.get("reasoning", ""),

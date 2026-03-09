@@ -116,3 +116,23 @@ class JobRepository:
             .limit(limit)
             .all()
         )
+
+    def clear_jobs(self, statuses: list[str] | None = None) -> int:
+        """
+        Delete jobs matching the given statuses (or all jobs if statuses is None).
+        Returns the number of rows deleted.
+        """
+        q = self.session.query(Job)
+        if statuses:
+            q = q.filter(Job.status.in_(statuses))
+        count = q.count()
+        q.delete(synchronize_session=False)
+        self.session.commit()
+        return count
+
+    def clear_applications(self) -> int:
+        """Delete all application records. Returns the number of rows deleted."""
+        count = self.session.query(Application).count()
+        self.session.query(Application).delete(synchronize_session=False)
+        self.session.commit()
+        return count

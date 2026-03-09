@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(
         "http://localhost:11434", description="Base URL for Ollama server (primary AI)"
     )
-    ollama_model: str = Field("qwen3:8b", description="Ollama model to use as primary AI")
+    ollama_model: str = Field("qwen3.5", description="Ollama model to use as primary AI")
+    ollama_vision_model: str = Field("qwen3.5", description="Ollama vision model for screenshot-based decisions")
 
     # Claude fallback (used when Ollama is unavailable)
     evaluator_model: str = Field("claude-opus-4-6", description="Claude fallback model for job fit evaluation")

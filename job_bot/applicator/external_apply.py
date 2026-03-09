@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 
@@ -22,6 +23,20 @@ Rules:
 - For file uploads, return null — the bot will skip those
 - For fields you cannot determine, return null
 - Return ONLY valid JSON — no explanation, no markdown fences
+
+Name handling:
+- "first_name" / "first name" / "fname" fields → use profile first_name (e.g. "Chen Yang")
+- "last_name" / "last name" / "lname" / "surname" fields → use profile last_name (e.g. "Xu")
+- "full_name" / "name" fields → use the full name (first_name + " " + last_name)
+
+Phone handling:
+- For phone number fields, use phone_number_only (digits only, no dashes, no country code)
+- If the field already shows a country code (+1), provide only the local number digits
+
+Address handling:
+- For US jobs: address = "8324 Regents Rd, San Diego, CA 92122", city = "San Diego", state = "CA", zip = "92122"
+- For Canadian jobs: address = "5626 Bell Harbour Dr, Mississauga, ON L5M 5J3", city = "Mississauga", province = "ON", postal = "L5M 5J3"
+- Infer US vs Canada from the job company/location context; default to US address if unclear
 
 Response format:
 {
@@ -129,89 +144,481 @@ Return JSON mapping field id or name to value. Use null for fields you should sk
         max_tokens=1024,
     )
 
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
+    from job_bot.ai.evaluator import _repair_and_parse
+    return _repair_and_parse(raw)
 
-    return json.loads(raw)
+
+async def _fill_page_fields(page, fields: list[dict], job: Job, cover_letter: str) -> int:
+    """Fill fields on the current page using AI. Returns number of fields filled."""
+    if not fields:
+        return 0
+    mapping = await fill_form_with_ai(page, fields, job, cover_letter)
+    filled = 0
+    for field in fields:
+        key = field["id"] or field["name"]
+        value = mapping.get(key)
+        if not value:
+            continue
+        try:
+            selector = f'#{field["id"]}' if field["id"] else f'[name="{field["name"]}"]'
+            el = await page.query_selector(selector)
+            if not el:
+                continue
+            if field["tag"] == "select":
+                try:
+                    await el.select_option(label=str(value))
+                except Exception:
+                    await el.select_option(value=str(value))
+            elif field["type"] == "radio":
+                await page.check(f'{selector}[value="{value}"]')
+            elif field["type"] == "checkbox":
+                if str(value).lower() in ("yes", "true", "1"):
+                    await el.check()
+            else:
+                await el.fill(str(value))
+            filled += 1
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            console.print(f"  [dim]Could not fill '{key}': {e}[/dim]")
+    return filled
+
+
+async def _handle_account_gate(page, email: str, password: str) -> bool:
+    """
+    Detect a login or sign-up gate and fill credentials.
+    Returns True if an account form was found and handled.
+    """
+    import asyncio
+
+    has_email_input = await page.query_selector(
+        'input[type="email"], input[name*="email" i], input[id*="email" i]'
+    )
+    has_password_input = await page.query_selector('input[type="password"]')
+
+    if not has_email_input:
+        return False
+
+    page_text = (await page.inner_text("body")).lower()
+    is_auth_page = any(kw in page_text for kw in (
+        "sign in", "log in", "login", "sign up", "create account",
+        "register", "welcome back", "create your account",
+    ))
+    if not is_auth_page and not has_password_input:
+        return False
+
+    is_signup = any(kw in page_text for kw in ("sign up", "create account", "register", "create your account"))
+    is_login = any(kw in page_text for kw in ("sign in", "log in", "login", "welcome back"))
+    console.print(f"  [dim]Account gate detected ({'sign-up' if is_signup and not is_login else 'sign-in'}) — filling credentials...[/dim]")
+
+    # If on signup page, try switching to sign-in first (we may already have an account)
+    if is_signup and not is_login:
+        for sel in [
+            "a:has-text('Sign in')", "a:has-text('Log in')", "a:has-text('Sign In')",
+            "a:has-text('Already have an account')", "a:has-text('already have an account')",
+            "button:has-text('Sign in')",
+        ]:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click()
+                    await asyncio.sleep(2)
+                    break
+            except Exception:
+                continue
+
+    # Fill email
+    try:
+        email_el = await page.query_selector(
+            'input[type="email"], input[name*="email" i], input[id*="email" i]'
+        )
+        if email_el and await email_el.is_visible():
+            await email_el.click(click_count=3)
+            await email_el.fill(email)
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+    # Some flows (Google-style) show password only after "Continue"
+    pw_el = await page.query_selector('input[type="password"]')
+    if not pw_el or not await pw_el.is_visible():
+        for cont_sel in [
+            "button:has-text('Continue')", "button:has-text('Next')",
+            "button[type='submit']", "input[type='submit']",
+        ]:
+            try:
+                el = await page.query_selector(cont_sel)
+                if el and await el.is_visible():
+                    await el.click()
+                    await asyncio.sleep(2)
+                    break
+            except Exception:
+                continue
+
+    # Fill password
+    try:
+        pw_el = await page.query_selector('input[type="password"]')
+        if pw_el and await pw_el.is_visible():
+            await pw_el.click(click_count=3)
+            await pw_el.fill(password)
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+    # Submit
+    for submit_sel in [
+        "button:has-text('Sign in')", "button:has-text('Log in')",
+        "button:has-text('Sign In')", "button:has-text('Log In')",
+        "button:has-text('Continue')", "button[type='submit']",
+        "input[type='submit']",
+    ]:
+        try:
+            el = await page.query_selector(submit_sel)
+            if el and await el.is_visible():
+                await el.click()
+                await asyncio.sleep(3)
+                break
+        except Exception:
+            continue
+
+    # If we landed on a signup form (new account created), fill name fields too
+    page_text_after = (await page.inner_text("body")).lower()
+    if any(kw in page_text_after for kw in ("first name", "last name", "create your profile")):
+        import yaml
+        from config.settings import settings
+        from pathlib import Path
+        try:
+            profile = yaml.safe_load(Path(settings.profile_path).read_text()) or {}
+            first = profile.get("first_name", "")
+            last = profile.get("last_name", "")
+            for fname_sel in ['input[name*="first" i]', 'input[id*="first" i]', 'input[placeholder*="first" i]']:
+                el = await page.query_selector(fname_sel)
+                if el and await el.is_visible() and first:
+                    await el.fill(first)
+                    break
+            for lname_sel in ['input[name*="last" i]', 'input[id*="last" i]', 'input[placeholder*="last" i]']:
+                el = await page.query_selector(lname_sel)
+                if el and await el.is_visible() and last:
+                    await el.fill(last)
+                    break
+            # Submit signup form
+            for s in ["button[type='submit']", "button:has-text('Continue')", "button:has-text('Create')"]:
+                el = await page.query_selector(s)
+                if el and await el.is_visible():
+                    await el.click()
+                    await asyncio.sleep(3)
+                    break
+        except Exception:
+            pass
+
+    return True
+
+
+async def _ai_decide_action(page, job: Job, step_num: int, settings) -> dict:
+    """
+    Take a screenshot + simplified HTML, ask the vision model to decide the next action.
+    Returns a dict: {action, button_text, reasoning}
+    Actions: fill_form | click_button | dismiss_cookie | check_agreements |
+             handle_account | done | stuck
+    """
+    import base64
+    from job_bot.ai.ollama_client import ollama_chat_vision
+
+    screenshot_bytes = await page.screenshot()
+    screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
+
+    try:
+        simplified = await page.evaluate("""() => {
+            const tags = 'input,select,textarea,button,label,h1,h2,h3,a[href],\
+[role="dialog"],.modal,[class*="cookie"],[class*="consent"],[class*="agreement"],\
+[class*="terms"],[class*="error"],[class*="alert"]';
+            return Array.from(document.querySelectorAll(tags))
+                .slice(0, 60)
+                .map(el => el.outerHTML.slice(0, 300))
+                .join('\\n');
+        }""")
+    except Exception:
+        simplified = ""
+
+    system = (
+        "You are controlling a browser to complete an external job application.\n"
+        "Look at the screenshot and page elements, then decide the single next action.\n"
+        "Return ONLY valid JSON — no markdown, no explanation:\n"
+        '{"action": "<type>", "button_text": "<exact visible text>", "reasoning": "<brief>"}\n\n'
+        "Action types:\n"
+        "- fill_form: Unfilled application form fields are visible\n"
+        "- click_button: Click a specific button (provide exact button_text)\n"
+        "- dismiss_cookie: A cookie/privacy banner is blocking interaction\n"
+        "- check_agreements: Unchecked agreement/terms/consent checkboxes present\n"
+        "- handle_account: Login or sign-up form is blocking (email+password fields visible)\n"
+        "- done: Confirmation/thank-you page — application submitted\n"
+        "- stuck: Cannot determine what to do\n\n"
+        "Priority order: dismiss_cookie > handle_account > check_agreements > fill_form > click_button > done > stuck"
+    )
+    user = (
+        f"Step {step_num}. Applying to: {job.title} at {job.company}\n"
+        f"URL: {page.url}\n\n"
+        f"Page elements:\n{simplified[:2500]}\n\n"
+        "What is the single next action? Return JSON only."
+    )
+
+    def _parse_json_action(raw: str) -> dict:
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+
+    # Try vision model first
+    try:
+        raw = ollama_chat_vision(
+            system=system,
+            user=user,
+            image_b64=screenshot_b64,
+            model=settings.ollama_vision_model,
+            base_url=settings.ollama_base_url,
+            max_tokens=300,
+        )
+        return _parse_json_action(raw)
+    except Exception as vision_err:
+        console.print(f"  [dim]Vision model failed ({vision_err}) — falling back to text-only[/dim]")
+
+    # Fallback: text-only model (no screenshot)
+    try:
+        from job_bot.ai.ollama_client import ollama_chat
+        raw = ollama_chat(
+            system=system,
+            user=user,
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            max_tokens=300,
+        )
+        return _parse_json_action(raw)
+    except Exception as text_err:
+        return {"action": "stuck", "reasoning": f"AI error: {text_err}"}
+
+
+async def _execute_ai_action(page, action_data: dict, job: Job, cover_letter: str,
+                              acct_email: str, acct_password: str, settings) -> bool:
+    """
+    Execute the action decided by _ai_decide_action.
+    Returns True if the application is confirmed done, False if stuck, None to continue.
+    """
+    action = action_data.get("action", "stuck")
+    btn_text = action_data.get("button_text", "")
+    reasoning = action_data.get("reasoning", "")
+    console.print(f"  [dim]AI: {action} — {reasoning}[/dim]")
+
+    if action == "done":
+        return True
+
+    if action == "stuck":
+        return False
+
+    if action == "dismiss_cookie":
+        for sel in [
+            "button:has-text('Accept all')", "button:has-text('Accept All')",
+            "button:has-text('Accept cookies')", "button:has-text('Accept Cookies')",
+            "button:has-text('I Accept')", "button:has-text('I agree')",
+            "button:has-text('Agree')", "button:has-text('Accept')",
+            "button:has-text('OK')", "button:has-text('Got it')",
+            "button:has-text('Close')", "[id*='cookie'] button", "[class*='cookie'] button",
+            "[id*='consent'] button", "[class*='consent'] button",
+        ]:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click()
+                    await asyncio.sleep(1.5)
+                    return None  # continue loop
+            except Exception:
+                continue
+        # Fallback: press Escape
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(1)
+        return None
+
+    if action == "check_agreements":
+        checkboxes = await page.query_selector_all('input[type="checkbox"]')
+        for cb in checkboxes:
+            try:
+                if await cb.is_visible() and not await cb.is_checked():
+                    label_text = await cb.evaluate("""el => {
+                        const id = el.id;
+                        const lbl = id ? document.querySelector('label[for="' + id + '"]') : null;
+                        return lbl ? lbl.innerText.toLowerCase() : (el.closest('label') || {innerText:''}).innerText.toLowerCase();
+                    }""")
+                    # Only check agreement/consent/terms checkboxes
+                    if any(kw in label_text for kw in (
+                        "agree", "accept", "consent", "terms", "privacy", "policy", "confirm", "acknowledge"
+                    )) or label_text.strip() == "":
+                        await cb.check()
+                        await asyncio.sleep(0.3)
+            except Exception:
+                continue
+        return None
+
+    if action == "handle_account":
+        if acct_email and acct_password:
+            await _handle_account_gate(page, acct_email, acct_password)
+            await asyncio.sleep(2)
+        return None
+
+    if action == "fill_form":
+        fields = await extract_form_fields(page)
+        if fields:
+            filled = await _fill_page_fields(page, fields, job, cover_letter)
+            console.print(f"  [dim]Filled {filled}/{len(fields)} fields[/dim]")
+        return None
+
+    if action == "click_button":
+        # Try exact text match first, then partial
+        for attempt in [f"button:has-text('{btn_text}')", f"input[value*='{btn_text}']",
+                        f"a:has-text('{btn_text}')"]:
+            try:
+                el = await page.query_selector(attempt)
+                if el and await el.is_visible():
+                    await el.click()
+                    await asyncio.sleep(2)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    return None
+            except Exception:
+                continue
+        # Fallback: any visible button containing the text
+        all_btns = await page.query_selector_all("button, input[type='submit'], a[role='button']")
+        for el in all_btns:
+            try:
+                if await el.is_visible():
+                    t = (await el.inner_text()).strip()
+                    if btn_text.lower() in t.lower():
+                        await el.click()
+                        await asyncio.sleep(2)
+                        return None
+            except Exception:
+                continue
+        console.print(f"  [yellow]Button '{btn_text}' not found[/yellow]")
+        return None
+
+    return None  # unknown action — continue
+
+
+async def _navigate_to_application_form(page) -> bool:
+    """
+    If the current page is a job listing (not a form), find and click the Apply button
+    to reach the actual application form. Returns True if navigation occurred.
+    """
+    apply_selectors = [
+        # Greenhouse
+        "a.apply-button",
+        "a[href*='/jobs/apply']",
+        "a[data-mapped='true'][href*='apply']",
+        # Lever
+        "a.postings-btn[href*='apply']",
+        # Workday / generic
+        "a[href*='apply']",
+        # Generic button/link text
+        "a:has-text('Apply for this Job')",
+        "a:has-text('Apply Now')",
+        "a:has-text('Apply now')",
+        "button:has-text('Apply for this Job')",
+        "button:has-text('Apply Now')",
+    ]
+
+    for sel in apply_selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                text = (await el.inner_text()).strip()
+                console.print(f"  [dim]Job listing page — clicking '{text}' to reach form...[/dim]")
+                await el.click()
+                await asyncio.sleep(3)
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            continue
+    return False
 
 
 async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
     """
     AI-driven form filler for external employer ATS pages.
-    Extracts form fields, asks Qwen3 what to fill, submits.
+    Handles job listing pages, account gates, and multi-step forms.
     """
-    import asyncio
     from config.settings import settings
+    from pathlib import Path
+    import yaml
 
     console.print(f"  [cyan]🌐 Attempting external apply at {page.url}[/cyan]")
 
+    # Load account credentials from profile
     try:
-        # Wait for form to load
+        profile = yaml.safe_load(Path(settings.profile_path).read_text()) or {}
+        acct_email = profile.get("account_email", "")
+        acct_password = profile.get("account_password", "")
+    except Exception:
+        acct_email, acct_password = "", ""
+
+    try:
+        # Wait for page to settle
         await asyncio.sleep(3)
+
+        # Handle account gate (login/signup) if present
+        if acct_email and acct_password:
+            await _handle_account_gate(page, acct_email, acct_password)
+            await asyncio.sleep(2)
 
         fields = await extract_form_fields(page)
+
+        # If no fields, try navigating from a job listing page
         if not fields:
-            console.print("  [yellow]No form fields found on external page[/yellow]")
-            return False
+            navigated = await _navigate_to_application_form(page)
+            if navigated:
+                await asyncio.sleep(2)
+                # Check for account gate again after navigation
+                if acct_email and acct_password:
+                    await _handle_account_gate(page, acct_email, acct_password)
+                    await asyncio.sleep(2)
+                fields = await extract_form_fields(page)
 
-        console.print(f"  [dim]Found {len(fields)} form fields — asking Qwen3 to fill...[/dim]")
-        mapping = await fill_form_with_ai(page, fields, job, cover_letter)
+        if fields:
+            console.print(f"  [dim]Found {len(fields)} form fields — asking Qwen3 to fill...[/dim]")
+            filled = await _fill_page_fields(page, fields, job, cover_letter)
+            console.print(f"  [dim]Filled {filled}/{len(fields)} fields[/dim]")
+        else:
+            console.print("  [dim]No standard form fields found — handing off to AI-guided loop[/dim]")
 
-        filled = 0
-        for field in fields:
-            key = field["id"] or field["name"]
-            value = mapping.get(key)
-            if not value:
-                continue
-
-            try:
-                selector = f'#{field["id"]}' if field["id"] else f'[name="{field["name"]}"]'
-                el = await page.query_selector(selector)
-                if not el:
-                    continue
-
-                if field["tag"] == "select":
-                    await el.select_option(label=str(value))
-                elif field["type"] == "radio":
-                    await page.check(f'{selector}[value="{value}"]')
-                elif field["type"] == "checkbox":
-                    if str(value).lower() in ("yes", "true", "1"):
-                        await el.check()
-                else:
-                    await el.fill(str(value))
-
-                filled += 1
-                await asyncio.sleep(0.2)
-            except Exception as e:
-                console.print(f"  [dim]Could not fill '{key}': {e}[/dim]")
-                continue
-
-        console.print(f"  [dim]Filled {filled}/{len(fields)} fields[/dim]")
-
-        # Screenshot before submit
+        # AI-guided multi-step loop: Claude sees screenshot + HTML and decides each action
         os.makedirs(settings.screenshots_dir, exist_ok=True)
-        screenshot_path = f"{settings.screenshots_dir}/{job.source}_{job.external_id}_external_pre_submit.png"
-        await page.screenshot(path=screenshot_path)
-        console.print(f"  [cyan]Screenshot saved: {screenshot_path}[/cyan]")
+        max_steps = 15
+        for form_step in range(max_steps):
+            action_data = await _ai_decide_action(page, job, form_step, settings)
+            result = await _execute_ai_action(
+                page, action_data, job, cover_letter, acct_email, acct_password, settings
+            )
 
-        # Find and click submit button
-        submit = await page.query_selector(
-            "button[type='submit'], input[type='submit'], "
-            "button:has-text('Submit'), button:has-text('Apply'), "
-            "button:has-text('Send Application')"
-        )
-        if not submit:
-            console.print("  [yellow]No submit button found on external page[/yellow]")
-            return False
+            # Save screenshot for audit trail
+            screenshot_path = (
+                f"{settings.screenshots_dir}/{job.source}_{job.external_id}"
+                f"_external_step{form_step}.png"
+            )
+            await page.screenshot(path=screenshot_path)
 
-        await submit.click()
-        await asyncio.sleep(3)
-        console.print(f"  [green]Submitted external application for {job.title} @ {job.company}[/green]")
-        return True
+            if result is True:
+                console.print(f"  [green]✓ Submitted external application for {job.title} @ {job.company}[/green]")
+                return True
+            if result is False:
+                console.print(f"  [yellow]AI could not proceed — flagging for manual review[/yellow]")
+                return False
+            # result is None → continue to next step
+
+        console.print(f"  [yellow]Reached max steps ({max_steps}) without confirmation[/yellow]")
+        return False
 
     except Exception as e:
         console.print(f"  [red]External apply error: {e}[/red]")

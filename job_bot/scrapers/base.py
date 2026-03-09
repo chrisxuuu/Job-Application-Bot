@@ -13,9 +13,10 @@ class SearchCriteria:
     keywords_required: list[str] = field(default_factory=list)
     keywords_excluded: list[str] = field(default_factory=list)
     experience_years_max: int = 0
+    easy_apply_only: bool = True
 
     @classmethod
-    def from_yaml(cls, path: str) -> "SearchCriteria":
+    def from_yaml(cls, path: str, easy_apply_only: bool = True) -> "SearchCriteria":
         import yaml
         with open(path) as f:
             data = yaml.safe_load(f)
@@ -26,6 +27,7 @@ class SearchCriteria:
             keywords_required=data.get("keywords_required", []),
             keywords_excluded=data.get("keywords_excluded", []),
             experience_years_max=data.get("experience_years_max", 0),
+            easy_apply_only=easy_apply_only,
         )
 
 

@@ -3,12 +3,16 @@
 Job Bot CLI — automated job scraping and application tool.
 
 Usage examples:
-  python cli.py run --dry-run           # Scrape & evaluate, no applications
-  python cli.py run                     # Live run
-  python cli.py run --source linkedin   # Single source
+  python cli.py run --dry-run               # Scrape & evaluate, no applications
+  python cli.py run                         # Live run (Easy Apply only)
+  python cli.py run --non-easy-apply        # Live run (non-Easy Apply jobs only)
+  python cli.py run --source linkedin       # Single source
   python cli.py login linkedin          # Save browser session
   python cli.py report                  # Show application history
   python cli.py review                  # List jobs flagged for manual review
+  python cli.py clear                   # Remove cached jobs (new/evaluated/skipped)
+  python cli.py clear --all             # Remove all jobs + application history
+  python cli.py clear --status applied  # Remove jobs with a specific status
   python cli.py schedule                # Start daily scheduler
 """
 
@@ -29,12 +33,29 @@ def run(
     source: Optional[str] = typer.Option(
         None, "--source", "-s", help="Source to run (currently only: linkedin)"
     ),
+    non_easy_apply: bool = typer.Option(
+        False, "--non-easy-apply", help="Search non-Easy Apply jobs only (omits f_AL=true filter)"
+    ),
+    max_applications: Optional[int] = typer.Option(
+        None, "--max-applications", "-m", help="Override max applications per day (for testing)"
+    ),
+    skip_scrape: bool = typer.Option(
+        False, "--skip-scrape", help="Skip scraping; apply to already-evaluated jobs in the DB"
+    ),
 ) -> None:
     """Scrape jobs, evaluate with AI, and apply."""
     from job_bot.pipeline import run_pipeline
 
     sources = [source] if source else None
-    asyncio.run(run_pipeline(sources=sources, dry_run=dry_run))
+    asyncio.run(
+        run_pipeline(
+            sources=sources,
+            dry_run=dry_run,
+            easy_apply_only=not non_easy_apply,
+            max_applications=max_applications,
+            skip_scrape=skip_scrape,
+        )
+    )
 
 
 @app.command()
@@ -194,6 +215,9 @@ def jobs(
 @app.command()
 def apply(
     dry_run: bool = typer.Option(False, "--dry-run/--live", help="Preview without submitting"),
+    max_applications: Optional[int] = typer.Option(
+        None, "--max-applications", "-m", help="Override max applications per day (for testing)"
+    ),
 ) -> None:
     """Apply to all evaluated jobs already in the database."""
     import asyncio
@@ -219,6 +243,7 @@ def apply(
 
     async def _run():
         daily_count = repo.get_daily_application_count()
+        daily_cap = max_applications if max_applications is not None else settings.max_applications_per_day
         scraper = LinkedInScraper(
             email=settings.linkedin_email,
             password=settings.linkedin_password,
@@ -227,8 +252,8 @@ def apply(
         async with scraper:
             await scraper.login()
             for job in jobs:
-                if daily_count >= settings.max_applications_per_day:
-                    console.print(f"[yellow]Daily limit ({settings.max_applications_per_day}) reached.[/yellow]")
+                if daily_count >= daily_cap:
+                    console.print(f"[yellow]Daily limit ({daily_cap}) reached.[/yellow]")
                     break
 
                 # Rebuild EvaluationResult from stored data
@@ -271,6 +296,67 @@ def apply(
                     console.print(f"  [yellow]✗ Failed — moved to manual review[/yellow]")
 
     asyncio.run(_run())
+    session.close()
+
+
+@app.command()
+def clear(
+    status: Optional[str] = typer.Option(
+        None,
+        "--status",
+        help="Only remove jobs with this status (new, evaluated, skipped, manual_review, applied)",
+    ),
+    all_data: bool = typer.Option(
+        False, "--all", help="Remove ALL jobs and application history"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Remove cached/scraped jobs from the database."""
+    from config.settings import settings
+    from job_bot.storage.database import init_db
+    from job_bot.storage.repository import JobRepository
+
+    session_factory = init_db(settings.db_path)
+    session = session_factory()
+    repo = JobRepository(session)
+
+    # Determine scope
+    if all_data:
+        target_statuses = None  # all jobs
+        scope_desc = "ALL jobs and application history"
+    elif status:
+        target_statuses = [status]
+        scope_desc = f"jobs with status '{status}'"
+    else:
+        # Default: remove unapplied cache (new + evaluated + skipped)
+        target_statuses = ["new", "evaluated", "skipped"]
+        scope_desc = "cached jobs (new / evaluated / skipped)"
+
+    # Preview count
+    from job_bot.models.job import Job as _Job
+    preview_q = session.query(_Job)
+    if target_statuses:
+        preview_q = preview_q.filter(_Job.status.in_(target_statuses))
+    job_count = preview_q.count()
+
+    if job_count == 0 and not all_data:
+        console.print(f"[dim]No {scope_desc} found — nothing to clear.[/dim]")
+        session.close()
+        return
+
+    if not yes:
+        console.print(f"[yellow]This will delete {job_count} {scope_desc}.[/yellow]")
+        if all_data:
+            console.print("[yellow]Application history will also be deleted.[/yellow]")
+        typer.confirm("Continue?", abort=True)
+
+    deleted_jobs = repo.clear_jobs(statuses=target_statuses)
+    console.print(f"[green]Deleted {deleted_jobs} job(s).[/green]")
+
+    if all_data:
+        deleted_apps = repo.clear_applications()
+        console.print(f"[green]Deleted {deleted_apps} application record(s).[/green]")
+
     session.close()
 
 

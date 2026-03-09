@@ -21,6 +21,9 @@ Source = Literal["linkedin"]
 async def run_pipeline(
     sources: list[Source] | None = None,
     dry_run: bool | None = None,
+    easy_apply_only: bool = True,
+    max_applications: int | None = None,
+    skip_scrape: bool = False,
 ) -> dict:
     if dry_run is None:
         dry_run = settings.dry_run
@@ -31,7 +34,7 @@ async def run_pipeline(
     enabled_sources: list[str] = raw.get("sources", ["linkedin"])
     sources = [s for s in (sources or enabled_sources) if s in enabled_sources]
 
-    criteria = SearchCriteria.from_yaml(settings.search_criteria_path)
+    criteria = SearchCriteria.from_yaml(settings.search_criteria_path, easy_apply_only=easy_apply_only)
 
     session_factory = init_db(settings.db_path)
     session = session_factory()
@@ -47,43 +50,48 @@ async def run_pipeline(
         "errors": 0,
     }
 
-    # Phase 1: Scrape
+    # Phase 1: Scrape (or load from DB)
     new_jobs: list[Job] = []
 
-    for source in sources:
-        console.rule(f"[bold blue]Scraping: {source}[/bold blue]")
-        try:
-            from job_bot.scrapers.linkedin import LinkedInScraper
-            scraper = LinkedInScraper(
-                email=settings.linkedin_email,
-                password=settings.linkedin_password,
-                headless=False,
-                request_delay_min=settings.request_delay_min,
-                request_delay_max=settings.request_delay_max,
-                max_jobs_per_session=settings.linkedin_max_jobs_per_session,
-            )
+    if skip_scrape:
+        console.rule("[bold blue]Skipping scrape — loading evaluated jobs from DB[/bold blue]")
+        new_jobs = repo.get_evaluated_jobs()
+        console.print(f"  Loaded [bold]{len(new_jobs)}[/bold] evaluated job(s) from database.\n")
+    else:
+        for source in sources:
+            console.rule(f"[bold blue]Scraping: {source}[/bold blue]")
+            try:
+                from job_bot.scrapers.linkedin import LinkedInScraper
+                scraper = LinkedInScraper(
+                    email=settings.linkedin_email,
+                    password=settings.linkedin_password,
+                    headless=False,
+                    request_delay_min=settings.request_delay_min,
+                    request_delay_max=settings.request_delay_max,
+                    max_jobs_per_session=settings.linkedin_max_jobs_per_session,
+                )
 
-            async with scraper:
-                await scraper.login()
+                async with scraper:
+                    await scraper.login()
 
-                async for job in scraper.search_jobs(criteria):
-                    summary["scraped"] += 1
-                    if repo.already_seen(job.source, job.external_id):
-                        continue
-                    job = await scraper.get_job_detail(job)
-                    saved = repo.upsert_job(job)
-                    new_jobs.append(saved)
-                    summary["new"] += 1
-                    console.print(f"  [dim]+[/dim] {saved.title} @ {saved.company}")
+                    async for job in scraper.search_jobs(criteria):
+                        summary["scraped"] += 1
+                        if repo.already_seen(job.source, job.external_id):
+                            continue
+                        job = await scraper.get_job_detail(job)
+                        saved = repo.upsert_job(job)
+                        new_jobs.append(saved)
+                        summary["new"] += 1
+                        console.print(f"  [dim]+[/dim] {saved.title} @ {saved.company}")
 
-        except Exception as e:
-            console.print(f"[red]Scraping failed: {e}[/red]")
-            summary["errors"] += 1
+            except Exception as e:
+                console.print(f"[red]Scraping failed: {e}[/red]")
+                summary["errors"] += 1
 
-    console.print(
-        f"\nScraped [bold]{summary['scraped']}[/bold] jobs, "
-        f"[bold]{summary['new']}[/bold] new.\n"
-    )
+        console.print(
+            f"\nScraped [bold]{summary['scraped']}[/bold] jobs, "
+            f"[bold]{summary['new']}[/bold] new.\n"
+        )
 
     # Phase 2: Evaluate
     from job_bot.ai.evaluator import evaluate_job
@@ -92,42 +100,60 @@ async def run_pipeline(
 
     jobs_to_apply: list[tuple[Job, str]] = []
 
-    for job in new_jobs:
-        console.print(f"  Evaluating: [cyan]{job.title}[/cyan] @ {job.company}")
-        try:
-            result = evaluate_job(job)
+    if skip_scrape:
+        # Jobs already evaluated — skip re-evaluation, just generate cover letters
+        console.rule("[bold blue]Generating cover letters (skip-scrape mode)[/bold blue]")
+        from job_bot.ai.cover_letter import generate_cover_letter
+        from job_bot.ai.evaluator import EvaluationResult
+        for job in new_jobs:
+            console.print(f"  [cyan]{job.title}[/cyan] @ {job.company} — score {job.fit_score}")
+            result = EvaluationResult(
+                score=job.fit_score or 0,
+                reasoning=job.fit_reasoning or "",
+                missing_requirements=list(filter(None, (job.missing_requirements or "").splitlines())),
+                standout_qualifications=list(filter(None, (job.standout_qualifications or "").splitlines())),
+                recommendation="apply",
+            )
+            cover_letter = generate_cover_letter(job, result)
+            jobs_to_apply.append((job, cover_letter))
             summary["evaluated"] += 1
+    else:
+        for job in new_jobs:
+            console.print(f"  Evaluating: [cyan]{job.title}[/cyan] @ {job.company}")
+            try:
+                result = evaluate_job(job)
+                summary["evaluated"] += 1
 
-            if result.recommendation == "apply" and result.score >= settings.min_fit_score:
-                status = "evaluated"
-            elif result.recommendation == "manual_review":
-                status = "manual_review"
-                summary["manual_review"] += 1
-            else:
-                status = "skipped"
-                summary["skipped"] += 1
+                if result.recommendation == "apply" and result.score >= settings.min_fit_score:
+                    status = "evaluated"
+                elif result.recommendation == "manual_review":
+                    status = "manual_review"
+                    summary["manual_review"] += 1
+                else:
+                    status = "skipped"
+                    summary["skipped"] += 1
 
-            repo.update_job_evaluation(
-                job_id=job.id,
-                fit_score=result.score,
-                fit_reasoning=result.reasoning,
-                missing_requirements="\n".join(result.missing_requirements),
-                standout_qualifications="\n".join(result.standout_qualifications),
-                status=status,
-            )
+                repo.update_job_evaluation(
+                    job_id=job.id,
+                    fit_score=result.score,
+                    fit_reasoning=result.reasoning,
+                    missing_requirements="\n".join(result.missing_requirements),
+                    standout_qualifications="\n".join(result.standout_qualifications),
+                    status=status,
+                )
 
-            console.print(
-                f"    Score: [bold]{result.score}[/bold] → {result.recommendation} ({status})"
-            )
+                console.print(
+                    f"    Score: [bold]{result.score}[/bold] → {result.recommendation} ({status})"
+                )
 
-            if status == "evaluated":
-                from job_bot.ai.cover_letter import generate_cover_letter
-                cover_letter = generate_cover_letter(job, result)
-                jobs_to_apply.append((job, cover_letter))
+                if status == "evaluated":
+                    from job_bot.ai.cover_letter import generate_cover_letter
+                    cover_letter = generate_cover_letter(job, result)
+                    jobs_to_apply.append((job, cover_letter))
 
-        except Exception as e:
-            console.print(f"    [red]Evaluation error: {e}[/red]")
-            summary["errors"] += 1
+            except Exception as e:
+                console.print(f"    [red]Evaluation error: {e}[/red]")
+                summary["errors"] += 1
 
     # Phase 3: Apply
     if not jobs_to_apply:
@@ -135,6 +161,8 @@ async def run_pipeline(
     else:
         console.rule("[bold blue]Applying to jobs[/bold blue]")
         daily_count = repo.get_daily_application_count()
+        daily_cap = max_applications if max_applications is not None else settings.max_applications_per_day
+        console.print(f"  Daily cap: [bold]{daily_cap}[/bold] (today so far: {daily_count})")
 
         if dry_run:
             for job, cover_letter in jobs_to_apply:
@@ -154,9 +182,9 @@ async def run_pipeline(
             async with scraper:
                 await scraper.login()
                 for job, cover_letter in jobs_to_apply:
-                    if daily_count >= settings.max_applications_per_day:
+                    if daily_count >= daily_cap:
                         console.print(
-                            f"[yellow]Daily limit ({settings.max_applications_per_day}) reached.[/yellow]"
+                            f"[yellow]Daily limit ({daily_cap}) reached.[/yellow]"
                         )
                         repo.update_job_status(job.id, "manual_review")
                         summary["manual_review"] += 1

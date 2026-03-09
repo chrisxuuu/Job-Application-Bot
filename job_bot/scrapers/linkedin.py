@@ -135,9 +135,11 @@ class LinkedInScraper(BaseScraper):
                     f"{self.JOBS_SEARCH_URL}"
                     f"?keywords={quote_plus(title)}"
                     f"&location={quote_plus(location)}"
-                    f"&f_AL=true"  # Easy Apply only
                 )
-                console.print(f"[blue]LinkedIn: searching '{title}' in '{location}'[/blue]")
+                if criteria.easy_apply_only:
+                    search_url += "&f_AL=true"
+                mode_label = "Easy Apply only" if criteria.easy_apply_only else "non-Easy Apply"
+                console.print(f"[blue]LinkedIn: searching '{title}' in '{location}' [{mode_label}][/blue]")
 
                 try:
                     await page.goto(search_url)
@@ -159,6 +161,11 @@ class LinkedInScraper(BaseScraper):
                         try:
                             job = await self._parse_job_card(card)
                             if job:
+                                # Filter by easy apply mode
+                                if criteria.easy_apply_only and not job.is_easy_apply:
+                                    continue
+                                if not criteria.easy_apply_only and job.is_easy_apply:
+                                    continue
                                 # Apply exclusion keywords
                                 if self._is_excluded(job, criteria):
                                     continue
@@ -201,6 +208,10 @@ class LinkedInScraper(BaseScraper):
             company = (await company_el.inner_text()).strip().splitlines()[0].strip() if company_el else "Unknown"
             location = (await location_el.inner_text()).strip().splitlines()[0].strip() if location_el else None
 
+            # Detect Easy Apply badge on the card
+            card_text = (await card.inner_text()).lower()
+            is_easy_apply = "easy apply" in card_text
+
             return Job(
                 source="linkedin",
                 external_id=external_id,
@@ -208,7 +219,7 @@ class LinkedInScraper(BaseScraper):
                 company=company,
                 location=location,
                 url=url,
-                is_easy_apply=True,
+                is_easy_apply=is_easy_apply,
                 status="new",
             )
         except Exception:
@@ -380,8 +391,29 @@ class LinkedInScraper(BaseScraper):
                 if btn_signature == prev_btn_signature:
                     stuck_count += 1
                     if stuck_count >= 2:
-                        console.print(f"  [yellow]Stuck on step {step} — required field likely blocking[/yellow]")
-                        break
+                        # Try to dismiss any open sub-form (Cancel button) before giving up
+                        cancelled = False
+                        for cancel_sel in [
+                            "button:has-text('Cancel')",
+                            "button[aria-label='Cancel']",
+                        ]:
+                            try:
+                                cancel_btn = await page.query_selector(cancel_sel)
+                                if cancel_btn and await cancel_btn.is_visible():
+                                    txt = (await cancel_btn.inner_text()).strip().lower()
+                                    if txt == "cancel":  # exact match — avoid Dismiss
+                                        console.print(f"  [dim]Stuck — cancelling open sub-form...[/dim]")
+                                        await cancel_btn.click()
+                                        await asyncio.sleep(1.0)
+                                        stuck_count = 0
+                                        prev_btn_signature = ""
+                                        cancelled = True
+                                        break
+                            except Exception:
+                                continue
+                        if not cancelled:
+                            console.print(f"  [yellow]Stuck on step {step} — required field likely blocking[/yellow]")
+                            break
                 else:
                     stuck_count = 0
                 prev_btn_signature = btn_signature
@@ -573,19 +605,24 @@ class LinkedInScraper(BaseScraper):
                     if el and await el.is_visible():
                         tag = await el.evaluate("e => e.tagName.toLowerCase()")
                         if tag == "select":
+                            # Skip hidden/disabled selects (e.g. end-date when currently_working)
+                            if not await el.is_enabled():
+                                continue
                             try:
-                                await el.select_option(label=value)
+                                await el.select_option(label=value, timeout=5000)
                             except Exception:
                                 # Try partial match on option text
                                 opts = await el.query_selector_all("option")
                                 for o in opts:
                                     ot = (await o.inner_text()).strip()
                                     if value.lower() in ot.lower() or ot.lower() in value.lower():
-                                        await el.select_option(value=await o.get_attribute("value") or ot)
+                                        await el.select_option(value=await o.get_attribute("value") or ot, timeout=5000)
                                         break
                         else:
-                            await el.click(click_count=3)
+                            await el.click(click_count=3, timeout=5000)
                             await el.fill(value)
+                            # Dismiss any autocomplete dropdown
+                            await page.keyboard.press("Escape")
                         await asyncio.sleep(0.3)
                         return True
                 except Exception:
@@ -612,6 +649,9 @@ class LinkedInScraper(BaseScraper):
                 ["input[id*='field'], input[aria-label*='field of study'], input[placeholder*='field']"],
                 data.get("field_of_study", ""),
             )
+            await asyncio.sleep(0.5)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
             # Start date
             if data.get("start_month"):
                 await _try_fill(
@@ -714,6 +754,137 @@ class LinkedInScraper(BaseScraper):
             except Exception:
                 continue
 
+    async def _collect_validation_errors(self, page, scope) -> list[dict]:
+        """Return [{field, error}] for any visible validation error messages in the modal."""
+        errors = []
+        selectors = [
+            ".artdeco-inline-feedback--error .artdeco-inline-feedback__message",
+            ".artdeco-inline-feedback__message",
+            "[data-test-form-element-error-message]",
+            ".fb-form-element__error-text",
+        ]
+        for sel in selectors:
+            try:
+                els = await (scope or page).query_selector_all(sel)
+                for el in els:
+                    if not await el.is_visible():
+                        continue
+                    msg = (await el.inner_text()).strip()
+                    if not msg:
+                        continue
+                    label = await el.evaluate("""el => {
+                        const c = el.closest('[data-test-form-element]')
+                            || el.closest('fieldset')
+                            || el.closest('.jobs-easy-apply-form-section__grouping')
+                            || el.parentElement;
+                        if (!c) return '';
+                        const l = c.querySelector('label, legend, .fb-form-element-label, .jobs-easy-apply-form-element__label');
+                        return l ? l.innerText.trim() : '';
+                    }""")
+                    errors.append({"field": label or "unknown", "error": msg})
+            except Exception:
+                continue
+        # Deduplicate
+        seen, unique = set(), []
+        for e in errors:
+            k = (e["field"], e["error"])
+            if k not in seen:
+                seen.add(k)
+                unique.append(e)
+        return unique
+
+    async def _apply_answers_to_fields(self, page, fields: list, answer_map: dict) -> None:
+        """Apply label→answer map to a list of extracted form fields."""
+        import re as _re
+
+        for f in fields:
+            key = f["label"].strip().lower()
+            answer = answer_map.get(key, "")
+
+            if f["kind"] == "input":
+                if not answer:
+                    lbl = f["label"].lower()
+                    if "year" in lbl or "experience" in lbl:
+                        answer = "3"
+                    else:
+                        continue
+                if f.get("type") == "number":
+                    answer = _re.sub(r"[^\d]", "", str(answer))
+                try:
+                    await f["element"].click(click_count=3, timeout=5000)
+                    await f["element"].fill(str(answer))
+                    await asyncio.sleep(0.4)
+                    # Dismiss any typeahead/autocomplete dropdown that may have appeared
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    console.print(f"  [dim]Could not fill '{f['label']}': {e}[/dim]")
+
+            elif f["kind"] == "radio":
+                ans_lower = answer.lower()
+                target_opt = None
+                for opt in f["options"]:
+                    if opt["label"].lower() == ans_lower or opt["value"].lower() == ans_lower:
+                        target_opt = opt
+                        break
+                if not target_opt:
+                    for opt in f["options"]:
+                        if opt["label"].lower() in ("yes", "y"):
+                            target_opt = opt
+                            break
+                if not target_opt and f["options"]:
+                    target_opt = f["options"][0]
+
+                if target_opt:
+                    async def _click_radio(opt):
+                        if opt.get("label_element"):
+                            try:
+                                await opt["label_element"].click()
+                                return
+                            except Exception:
+                                pass
+                        try:
+                            await opt["element"].click()
+                        except Exception:
+                            try:
+                                await opt["element"].check()
+                            except Exception as err:
+                                console.print(f"  [dim]Radio click failed '{f['label']}': {err}[/dim]")
+
+                    await _click_radio(target_opt)
+                    await asyncio.sleep(0.3)
+                    console.print(f"  [dim]Radio '{f['label']}' → '{target_opt['label']}'[/dim]")
+
+            elif f["kind"] == "select":
+                _placeholders = {"month", "year", "select", "choose", "please select", ""}
+                if not answer or answer.strip().lower() in _placeholders:
+                    continue
+                try:
+                    # Skip hidden/disabled selects (e.g. end-date when currently working)
+                    is_visible = await f["element"].is_visible()
+                    is_enabled = await f["element"].is_enabled()
+                    if not is_visible or not is_enabled:
+                        continue
+                    opts = f.get("options", [])
+                    ans_lower = answer.strip().lower()
+                    matched = None
+                    for opt in opts:
+                        if opt.strip().lower() == ans_lower:
+                            matched = opt
+                            break
+                    if not matched:
+                        for opt in opts:
+                            if ans_lower in opt.strip().lower() or opt.strip().lower() in ans_lower:
+                                matched = opt
+                                break
+                    if matched:
+                        await f["element"].select_option(label=matched, timeout=5000)
+                    else:
+                        await f["element"].select_option(value=answer, timeout=5000)
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    console.print(f"  [dim]Select failed '{f['label']}': {e}[/dim]")
+
     async def _handle_easy_apply_step(self, page, cover_letter: str) -> None:
         """
         Fill all visible form fields on the current Easy Apply modal step.
@@ -737,13 +908,16 @@ class LinkedInScraper(BaseScraper):
             edu_list = profile_data.get("education", [])
             exp_list = profile_data.get("experience", [])
 
+            # Only add entries if the section is empty (Remove/Edit = already populated)
+            has_existing_entries = bool(await scope.query_selector("button:has-text('Remove')"))
+
             for btn in await scope.query_selector_all("button"):
                 if not await btn.is_visible():
                     continue
                 txt = (await btn.inner_text()).strip().lower()
-                if "add" in txt and "education" in txt and edu_list:
+                if "add" in txt and "education" in txt and edu_list and not has_existing_entries:
                     await self._fill_add_section(page, scope, "education", edu_list[0])
-                elif "add" in txt and any(kw in txt for kw in ("experience", "work", "position")) and exp_list:
+                elif "add" in txt and any(kw in txt for kw in ("experience", "work", "position")) and exp_list and not has_existing_entries:
                     await self._fill_add_section(page, scope, "experience", exp_list[0])
         except Exception as e:
             console.print(f"  [yellow]Add-section handling failed: {e}[/yellow]")
@@ -852,9 +1026,14 @@ class LinkedInScraper(BaseScraper):
             'Each object: {"label": "<exact field label>", "answer": "<your answer>"}\n'
             "Rules:\n"
             "- Work authorization / legally authorized to work → Yes\n"
-            "- Require sponsorship / visa sponsorship → No\n"
+            "- Require sponsorship / visa sponsorship / immigration sponsorship / will require sponsorship → No\n"
             "- For radios/selects pick an exact option from the provided list\n"
             "- For salary fields return a whole integer only (e.g. 105000), no symbols, no decimals, no ranges\n"
+            "- Number/years fields: return digits only (e.g. 3)\n"
+            "- Address / physical address / street address → use address_us ('8324 Regents Rd, San Diego, CA 92122') for US jobs, address_ca ('5626 Bell Harbour Dr, Mississauga, ON L5M 5J3') for Canadian jobs\n"
+            "- City → San Diego (US) or Mississauga (CA)\n"
+            "- State/Province → CA (US) or ON (Canada)\n"
+            "- Zip/Postal code → 92122 (US) or L5M 5J3 (Canada)\n"
             "- Use the candidate profile/resume for all other answers\n"
             "- Return ONLY a valid JSON array, no explanation or markdown"
         )
@@ -867,6 +1046,7 @@ class LinkedInScraper(BaseScraper):
 
         answer_map: dict = {}
         try:
+            from job_bot.ai.evaluator import _repair_and_parse
             raw = ollama_chat(
                 system=system_prompt,
                 user=user_prompt,
@@ -874,87 +1054,66 @@ class LinkedInScraper(BaseScraper):
                 base_url=settings.ollama_base_url,
                 max_tokens=512,
             )
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            answers = json.loads(raw.strip())
+            answers = _repair_and_parse(raw)
             answer_map = {a["label"].strip().lower(): str(a["answer"]) for a in answers}
             console.print(f"  [dim]AI answers: {answer_map}[/dim]")
         except Exception as e:
             console.print(f"  [yellow]AI field-fill failed ({e}) — using defaults[/yellow]")
 
         # --- 4. Apply answers ---
-        for f in fields:
-            key = f["label"].strip().lower()
-            answer = answer_map.get(key, "")
+        await self._apply_answers_to_fields(page, fields, answer_map)
 
-            if f["kind"] == "input":
-                if not answer:
-                    lbl = f["label"].lower()
-                    if "year" in lbl or "experience" in lbl:
-                        answer = "3"
-                    else:
-                        continue
-                # For number inputs, strip any non-numeric characters Qwen may have added
-                if f.get("type") == "number":
-                    import re as _re
-                    answer = _re.sub(r"[^\d]", "", str(answer))
-                try:
-                    await f["element"].click(click_count=3)
-                    await f["element"].fill(str(answer))
-                    await asyncio.sleep(0.2)
-                except Exception as e:
-                    console.print(f"  [dim]Could not fill '{f['label']}': {e}[/dim]")
+        # --- 5. Check for validation errors and let Qwen fix them ---
+        await asyncio.sleep(0.5)
+        errors = await self._collect_validation_errors(page, scope)
+        if not errors:
+            return
 
-            elif f["kind"] == "radio":
-                ans_lower = answer.lower()
+        console.print(f"  [yellow]Validation errors — asking AI to correct {len(errors)} field(s):[/yellow]")
+        for e in errors:
+            console.print(f"    [dim]{e['field']}: {e['error']}[/dim]")
 
-                # Find the best matching option, then fall back to Yes / first
-                target_opt = None
-                for opt in f["options"]:
-                    if opt["label"].lower() == ans_lower or opt["value"].lower() == ans_lower:
-                        target_opt = opt
-                        break
-                if not target_opt:
-                    for opt in f["options"]:
-                        if opt["label"].lower() in ("yes", "y"):
-                            target_opt = opt
-                            break
-                if not target_opt and f["options"]:
-                    target_opt = f["options"][0]
+        error_labels = {e["field"].strip().lower() for e in errors}
+        retry_fields = [f for f in fields if f["label"].strip().lower() in error_labels] or fields
 
-                if target_opt:
-                    # LinkedIn hides the <input> via CSS — clicking the <label> is required
-                    async def _click_radio(opt):
-                        if opt.get("label_element"):
-                            try:
-                                await opt["label_element"].click()
-                                return
-                            except Exception:
-                                pass
-                        # Fallback: click the input directly or use check()
-                        try:
-                            await opt["element"].click()
-                        except Exception:
-                            try:
-                                await opt["element"].check()
-                            except Exception as e:
-                                console.print(f"  [dim]Radio click failed '{f['label']}': {e}[/dim]")
+        retry_info = []
+        for f in retry_fields:
+            info = {
+                "label": f["label"],
+                "type": f.get("type", f["kind"]),
+                "current_wrong_answer": answer_map.get(f["label"].strip().lower(), ""),
+            }
+            if f["kind"] in ("radio", "select"):
+                info["options"] = [o["label"] if isinstance(o, dict) else o for o in f["options"]]
+            retry_info.append(info)
 
-                    await _click_radio(target_opt)
-                    await asyncio.sleep(0.3)
-                    console.print(f"  [dim]Radio '{f['label']}' → '{target_opt['label']}'[/dim]")
-
-            elif f["kind"] == "select":
-                if not answer:
-                    continue
-                try:
-                    try:
-                        await f["element"].select_option(label=answer)
-                    except Exception:
-                        await f["element"].select_option(value=answer)
-                    await asyncio.sleep(0.2)
-                except Exception as e:
-                    console.print(f"  [dim]Select failed '{f['label']}': {e}[/dim]")
+        error_list = "\n".join(f'- "{e["field"]}": {e["error"]}' for e in errors)
+        try:
+            raw_retry = ollama_chat(
+                system=(
+                    "You are correcting job application form answers that caused validation errors.\n"
+                    "Return ONLY a valid JSON array: [{\"label\": \"...\", \"answer\": \"...\"}]\n"
+                    "Rules:\n"
+                    "- Number/years fields: return digits only (e.g. 3, not 'Yes', not '3 years')\n"
+                    "- Radio/select: pick an exact option string from the provided options list\n"
+                    "- Salary: whole integer only (e.g. 105000)\n"
+                    "- Require sponsorship / visa sponsorship / immigration sponsorship → No\n"
+                    "- Return ONLY valid JSON array, no explanation, no markdown"
+                ),
+                user=(
+                    f"Validation errors from the previous answer attempt:\n{error_list}\n\n"
+                    f"Fields to fix:\n{json.dumps(retry_info, indent=2)}\n\n"
+                    f"Candidate Profile:\n{profile_text[:800]}\n\n"
+                    "Return corrected JSON array:"
+                ),
+                model=settings.ollama_model,
+                base_url=settings.ollama_base_url,
+                max_tokens=256,
+            )
+            from job_bot.ai.evaluator import _repair_and_parse
+            retry_answers = _repair_and_parse(raw_retry)
+            retry_map = {a["label"].strip().lower(): str(a["answer"]) for a in retry_answers}
+            console.print(f"  [dim]Retry answers: {retry_map}[/dim]")
+            await self._apply_answers_to_fields(page, retry_fields, retry_map)
+        except Exception as e:
+            console.print(f"  [yellow]Retry prompt failed: {e}[/yellow]")
