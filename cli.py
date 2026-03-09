@@ -30,7 +30,7 @@ def run(
         None, "--source", "-s", help="Source to run (currently only: linkedin)"
     ),
 ) -> None:
-    """Scrape jobs, evaluate with Claude, and apply."""
+    """Scrape jobs, evaluate with AI, and apply."""
     from job_bot.pipeline import run_pipeline
 
     sources = [source] if source else None
