@@ -620,6 +620,68 @@ async def _navigate_to_application_form(page) -> bool:
     return False
 
 
+async def _upload_resume(page, resume_pdf_path: str) -> bool:
+    """
+    Find a resume file-upload input (visible or hidden) and upload the PDF.
+    Also handles 'Upload Resume' buttons that trigger a hidden <input type=file>.
+    Returns True if the file was uploaded.
+    """
+    # 1. Direct file input (may be hidden — ATS sites often hide it behind a styled button)
+    for sel in [
+        'input[type="file"][name*="resume" i]',
+        'input[type="file"][id*="resume" i]',
+        'input[type="file"][accept*="pdf" i]',
+        'input[type="file"][accept*=".pdf"]',
+        'input[type="file"]',
+    ]:
+        try:
+            el = await page.query_selector(sel)
+            if el:
+                await el.set_input_files(resume_pdf_path)
+                await asyncio.sleep(1.5)
+                console.print(f"  [green]📎 Resume uploaded via file input[/green]")
+                return True
+        except Exception:
+            continue
+
+    # 2. Click a visible "Upload Resume" button to reveal the hidden input, then upload
+    for btn_sel in [
+        "button:has-text('Upload Resume')",
+        "button:has-text('Upload resume')",
+        "button:has-text('Attach Resume')",
+        "button:has-text('Choose File')",
+        "label:has-text('Upload Resume')",
+        "label:has-text('Upload resume')",
+        "label[for*='resume' i]",
+        "label[for*='file' i]",
+    ]:
+        try:
+            btn = await page.query_selector(btn_sel)
+            if btn and await btn.is_visible():
+                # If it's a <label for="...">, grab the associated input directly
+                for_attr = await btn.get_attribute("for")
+                if for_attr:
+                    file_input = await page.query_selector(f'#{for_attr}')
+                    if file_input:
+                        await file_input.set_input_files(resume_pdf_path)
+                        await asyncio.sleep(1.5)
+                        console.print(f"  [green]📎 Resume uploaded via label input[/green]")
+                        return True
+
+                # Otherwise click the button and wait for a file chooser dialog
+                async with page.expect_file_chooser(timeout=5000) as fc_info:
+                    await btn.click()
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(resume_pdf_path)
+                await asyncio.sleep(1.5)
+                console.print(f"  [green]📎 Resume uploaded via file chooser[/green]")
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
     """
     AI-driven form filler for external employer ATS pages.
@@ -639,6 +701,14 @@ async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
     except Exception:
         acct_email, acct_password = "", ""
 
+    # Build resume PDF (cached — only re-renders if resume.md changed)
+    try:
+        from job_bot.utils.resume_pdf import build_resume_pdf
+        resume_pdf = build_resume_pdf(settings.resume_path, settings.resume_path.replace(".md", ".pdf"))
+    except Exception as e:
+        console.print(f"  [yellow]Could not build resume PDF: {e}[/yellow]")
+        resume_pdf = None
+
     try:
         # Wait for page to settle
         await asyncio.sleep(3)
@@ -647,6 +717,10 @@ async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
         if acct_email and acct_password:
             await _handle_account_gate(page, acct_email, acct_password)
             await asyncio.sleep(2)
+
+        # Upload resume if a file input is present
+        if resume_pdf:
+            await _upload_resume(page, resume_pdf)
 
         fields = await extract_form_fields(page)
 
@@ -670,6 +744,8 @@ async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
                 if acct_email and acct_password:
                     await _handle_account_gate(page, acct_email, acct_password)
                     await asyncio.sleep(2)
+                if resume_pdf:
+                    await _upload_resume(page, resume_pdf)
                 fields = await extract_form_fields(page)
 
         if fields:
@@ -727,6 +803,8 @@ async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
                         pass
                     console.print(f"  [dim]Switched to new tab: {new_page.url}[/dim]")
                     current_page = new_page
+                    if resume_pdf:
+                        await _upload_resume(current_page, resume_pdf)
                 consecutive_failures = 0
                 last_action_key = ""
                 continue
