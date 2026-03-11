@@ -7,27 +7,27 @@ Automated job scraping and application bot targeting LinkedIn Easy Apply and ext
 ```mermaid
 graph TB
     subgraph LI["🔵 LinkedIn"]
-        LI1("Job Search\n(Easy Apply filter)")
-        LI2("Easy Apply Modal\nMulti-step form walker")
-        LI3("External Apply\nATS redirect handler")
+        LI1("Job Search<br/>(Easy Apply filter)")
+        LI2("Easy Apply Modal<br/>Multi-step form walker")
+        LI3("External Apply<br/>ATS redirect handler")
     end
 
     subgraph PW["🎭 Playwright"]
-        PW1("Persistent Browser Profile\nCookies survive restarts")
-        PW2("Screenshot Capture\nAudit trail per submission")
-        PW3("DOM Interaction\nFill · Click · Select")
+        PW1("Persistent Browser Profile<br/>Cookies survive restarts")
+        PW2("Screenshot Capture<br/>Audit trail per submission")
+        PW3("DOM Interaction<br/>Fill · Click · Select")
     end
 
     subgraph AI["🤖 AI Model"]
-        AI1("Qwen3.5 · 9.7B · Q4_K_M\nvia Ollama")
-        AI2("Tailscale VPN\n100.99.x.x:11434")
-        AI3("Vision Loop\nScreenshot → action decisions")
-        AI4("Claude Opus 4.6\nFallback if Ollama down")
+        AI1("Qwen3.5 · 9.7B · Q4_K_M<br/>via Ollama")
+        AI2("Tailscale VPN<br/>100.99.x.x:11434")
+        AI3("Vision Loop<br/>Screenshot → action decisions")
+        AI4("Claude Opus 4.6<br/>Fallback if Ollama down")
     end
 
     subgraph PIPE["⚙️ Pipeline"]
         P1["Scrape"]
-        P2["Evaluate\nFit score 0–100"]
+        P2["Evaluate<br/>Fit score 0–100"]
         P3["Cover Letter"]
         P4["Apply"]
     end
