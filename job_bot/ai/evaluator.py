@@ -101,10 +101,18 @@ def _repair_and_parse(raw: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Extract the first {...} block (handles leading/trailing prose)
-    match = re.search(r"\{[\s\S]*\}", s)
-    if match:
-        s = match.group(0)
+    # Extract the first complete balanced {...} block (handles trailing prose / "Extra data")
+    brace_start = s.find("{")
+    if brace_start != -1:
+        depth = 0
+        for i, ch in enumerate(s[brace_start:], brace_start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    s = s[brace_start:i + 1]
+                    break
 
     try:
         return json.loads(s)

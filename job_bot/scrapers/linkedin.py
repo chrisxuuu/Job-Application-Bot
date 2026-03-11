@@ -276,6 +276,37 @@ class LinkedInScraper(BaseScraper):
                 if desc_el:
                     job.description = (await desc_el.inner_text()).strip()
 
+            # Fill in title/company from detail pane if card parsing returned "Unknown"
+            if job.title == "Unknown":
+                for sel in [
+                    ".job-details-jobs-unified-top-card__job-title h1",
+                    ".job-details-jobs-unified-top-card__job-title",
+                    ".jobs-unified-top-card__job-title h1",
+                    ".jobs-unified-top-card__job-title",
+                    "h1.t-24",
+                    "h1",
+                ]:
+                    el = await page.query_selector(sel)
+                    if el:
+                        txt = (await el.inner_text()).strip().splitlines()[0].strip()
+                        if txt:
+                            job.title = txt
+                            break
+            if job.company == "Unknown":
+                for sel in [
+                    ".job-details-jobs-unified-top-card__company-name a",
+                    ".job-details-jobs-unified-top-card__company-name",
+                    ".jobs-unified-top-card__company-name a",
+                    ".jobs-unified-top-card__company-name",
+                    "[class*='top-card'] [class*='company']",
+                ]:
+                    el = await page.query_selector(sel)
+                    if el:
+                        txt = (await el.inner_text()).strip().splitlines()[0].strip()
+                        if txt:
+                            job.company = txt
+                            break
+
             # Detect "No longer accepting applications"
             top_card_el = await page.query_selector(
                 ".jobs-details-top-card__apply-error, "
@@ -445,6 +476,9 @@ class LinkedInScraper(BaseScraper):
             stuck_count = 0
             for step in range(max_steps):
                 await asyncio.sleep(0.5)
+
+                # Dismiss discard-confirmation overlay if it appeared (blocks all clicks)
+                await self._dismiss_discard_confirmation(page)
 
                 # Dump current modal buttons for diagnostics
                 modal_btns = await page.query_selector_all(
@@ -875,11 +909,34 @@ class LinkedInScraper(BaseScraper):
                 unique.append(e)
         return unique
 
+    async def _dismiss_discard_confirmation(self, page) -> bool:
+        """
+        If LinkedIn's 'discard application' confirmation overlay is visible,
+        click 'Cancel' to return to the form (do NOT discard).
+        Returns True if the modal was found and dismissed.
+        """
+        try:
+            modal = await page.query_selector(
+                "[data-test-modal-id='data-test-easy-apply-discard-confirmation']"
+            )
+            if modal and await modal.is_visible():
+                for sel in ["button:has-text('Cancel')", "button[data-test-dialog-secondary-btn]"]:
+                    btn = await page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(0.5)
+                        return True
+        except Exception:
+            pass
+        return False
+
     async def _apply_answers_to_fields(self, page, fields: list, answer_map: dict) -> None:
         """Apply label→answer map to a list of extracted form fields."""
         import re as _re
 
         for f in fields:
+            # Dismiss discard-confirmation overlay before each interaction
+            await self._dismiss_discard_confirmation(page)
             key = f["label"].strip().lower()
             answer = answer_map.get(key, "")
 
