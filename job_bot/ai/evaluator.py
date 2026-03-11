@@ -80,6 +80,12 @@ def _repair_and_parse(raw: str) -> dict:
 
     s = raw.strip()
 
+    # Strip <think>...</think> blocks (Qwen3.5 can leak these even with think:false)
+    s = re.sub(r"<think>[\s\S]*?</think>", "", s, flags=re.IGNORECASE).strip()
+
+    # Strip JavaScript-style // line comments (model sometimes adds these)
+    s = re.sub(r"//[^\n]*", "", s)
+
     # Strip markdown fences
     if s.startswith("```"):
         parts = s.split("```")

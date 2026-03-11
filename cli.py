@@ -6,6 +6,7 @@ Usage examples:
   python cli.py run --dry-run               # Scrape & evaluate, no applications
   python cli.py run                         # Live run (Easy Apply only)
   python cli.py run --non-easy-apply        # Live run (non-Easy Apply jobs only)
+  python cli.py run --skip-scrape           # Skip Scraping. Apply for jobs in the database.
   python cli.py run --source linkedin       # Single source
   python cli.py login linkedin          # Save browser session
   python cli.py report                  # Show application history

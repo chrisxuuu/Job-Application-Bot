@@ -79,6 +79,9 @@ async def run_pipeline(
                         if repo.already_seen(job.source, job.external_id):
                             continue
                         job = await scraper.get_job_detail(job)
+                        if job.status == "closed":
+                            summary["skipped"] += 1
+                            continue
                         saved = repo.upsert_job(job)
                         new_jobs.append(saved)
                         summary["new"] += 1

@@ -398,8 +398,23 @@ async def _ai_decide_action(page, job: Job, step_num: int, settings) -> dict:
         return {"action": "stuck", "reasoning": f"AI error: {text_err}"}
 
 
+async def _switch_to_newest_page(context, current_page):
+    """If a new tab was opened, switch to it and return it. Otherwise return current_page."""
+    try:
+        pages = context.pages
+        if len(pages) > 1:
+            newest = pages[-1]
+            if newest != current_page:
+                await newest.wait_for_load_state("domcontentloaded", timeout=10000)
+                console.print(f"  [dim]Switched to new tab: {newest.url}[/dim]")
+                return newest
+    except Exception:
+        pass
+    return current_page
+
+
 async def _execute_ai_action(page, action_data: dict, job: Job, cover_letter: str,
-                              acct_email: str, acct_password: str, settings) -> bool:
+                              acct_email: str, acct_password: str, settings, context=None) -> bool:
     """
     Execute the action decided by _ai_decide_action.
     Returns True if the application is confirmed done, False if stuck, None to continue.
@@ -417,6 +432,17 @@ async def _execute_ai_action(page, action_data: dict, job: Job, cover_letter: st
 
     if action == "dismiss_cookie":
         for sel in [
+            # OneTrust specific
+            "#onetrust-accept-btn-handler",
+            "#accept-recommended-btn-handler",
+            "button.ot-pc-refuse-all-handler",
+            "button#onetrust-pc-btn-handler",
+            "button:has-text('Confirm My Choices')",
+            "button:has-text('Confirm my choices')",
+            "button:has-text('Save My Choices')",
+            "button:has-text('Accept All Cookies')",
+            "button:has-text('Allow All')",
+            # Generic
             "button:has-text('Accept all')", "button:has-text('Accept All')",
             "button:has-text('Accept cookies')", "button:has-text('Accept Cookies')",
             "button:has-text('I Accept')", "button:has-text('I agree')",
@@ -424,6 +450,7 @@ async def _execute_ai_action(page, action_data: dict, job: Job, cover_letter: st
             "button:has-text('OK')", "button:has-text('Got it')",
             "button:has-text('Close')", "[id*='cookie'] button", "[class*='cookie'] button",
             "[id*='consent'] button", "[class*='consent'] button",
+            "#onetrust-banner-sdk button", ".optanon-alert-box-wrapper button",
         ]:
             try:
                 el = await page.query_selector(sel)
@@ -472,34 +499,82 @@ async def _execute_ai_action(page, action_data: dict, job: Job, cover_letter: st
         return None
 
     if action == "click_button":
-        # Try exact text match first, then partial
-        for attempt in [f"button:has-text('{btn_text}')", f"input[value*='{btn_text}']",
-                        f"a:has-text('{btn_text}')"]:
+        pages_before = len(context.pages) if context else 0
+
+        async def _try_click(el) -> bool:
             try:
-                el = await page.query_selector(attempt)
-                if el and await el.is_visible():
+                if await el.is_visible():
+                    await el.scroll_into_view_if_needed()
                     await el.click()
                     await asyncio.sleep(2)
                     try:
                         await page.wait_for_load_state("domcontentloaded", timeout=10000)
                     except Exception:
                         pass
-                    return None
+                    return True
+            except Exception:
+                pass
+            return False
+
+        clicked_ok = False
+
+        # 1. Playwright locator (handles apostrophes/special chars correctly)
+        for locator in [
+            page.get_by_role("button", name=btn_text),
+            page.get_by_role("link", name=btn_text),
+            page.get_by_text(btn_text, exact=True),
+        ]:
+            try:
+                el = locator.first
+                if await el.count() and await el.is_visible():
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    await asyncio.sleep(2)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    clicked_ok = True
+                    break
             except Exception:
                 continue
-        # Fallback: any visible button containing the text
-        all_btns = await page.query_selector_all("button, input[type='submit'], a[role='button']")
-        for el in all_btns:
-            try:
-                if await el.is_visible():
+
+        if not clicked_ok:
+            # 2. Iterate all clickable elements for partial text match
+            all_btns = await page.query_selector_all("button, input[type='submit'], a[role='button'], a")
+            for el in all_btns:
+                try:
                     t = (await el.inner_text()).strip()
                     if btn_text.lower() in t.lower():
-                        await el.click()
-                        await asyncio.sleep(2)
-                        return None
+                        if await _try_click(el):
+                            clicked_ok = True
+                            break
+                except Exception:
+                    continue
+
+        if not clicked_ok:
+            # 3. JavaScript fallback — find by visible text across whole DOM
+            try:
+                clicked = await page.evaluate("""(text) => {
+                    const els = [...document.querySelectorAll('button, a, [role="button"]')];
+                    const match = els.find(e => e.offsetParent !== null &&
+                        e.innerText && e.innerText.trim().toLowerCase().includes(text.toLowerCase()));
+                    if (match) { match.click(); return true; }
+                    return false;
+                }""", btn_text)
+                if clicked:
+                    await asyncio.sleep(2)
+                    clicked_ok = True
             except Exception:
-                continue
-        console.print(f"  [yellow]Button '{btn_text}' not found[/yellow]")
+                pass
+
+        if not clicked_ok:
+            console.print(f"  [yellow]Button '{btn_text}' not found[/yellow]")
+            return "button_not_found"  # distinct sentinel for stuck detection
+
+        # After a successful click, check if a new tab was opened — caller must handle page swap
+        if context and len(context.pages) > pages_before:
+            return "new_tab_opened"
         return None
 
     return None  # unknown action — continue
@@ -580,6 +655,17 @@ async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
             navigated = await _navigate_to_application_form(page)
             if navigated:
                 await asyncio.sleep(2)
+                # If navigation opened a new tab, switch to it and close extras
+                ctx = page.context
+                all_pages = ctx.pages
+                if len(all_pages) > 1:
+                    page = all_pages[-1]
+                    for p in all_pages[1:-1]:
+                        try:
+                            await p.close()
+                        except Exception:
+                            pass
+                    console.print(f"  [dim]Navigated to new tab: {page.url}[/dim]")
                 # Check for account gate again after navigation
                 if acct_email and acct_password:
                     await _handle_account_gate(page, acct_email, acct_password)
@@ -595,11 +681,16 @@ async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
 
         # AI-guided multi-step loop: Claude sees screenshot + HTML and decides each action
         os.makedirs(settings.screenshots_dir, exist_ok=True)
+        context = page.context
+        current_page = page
         max_steps = 15
+        consecutive_failures = 0
+        last_action_key = ""
         for form_step in range(max_steps):
-            action_data = await _ai_decide_action(page, job, form_step, settings)
+            action_data = await _ai_decide_action(current_page, job, form_step, settings)
             result = await _execute_ai_action(
-                page, action_data, job, cover_letter, acct_email, acct_password, settings
+                current_page, action_data, job, cover_letter,
+                acct_email, acct_password, settings, context=context
             )
 
             # Save screenshot for audit trail
@@ -607,13 +698,49 @@ async def apply_on_external_site(page, job: Job, cover_letter: str) -> bool:
                 f"{settings.screenshots_dir}/{job.source}_{job.external_id}"
                 f"_external_step{form_step}.png"
             )
-            await page.screenshot(path=screenshot_path)
+            try:
+                await current_page.screenshot(path=screenshot_path)
+            except Exception:
+                pass
 
             if result is True:
                 console.print(f"  [green]✓ Submitted external application for {job.title} @ {job.company}[/green]")
                 return True
             if result is False:
                 console.print(f"  [yellow]AI could not proceed — flagging for manual review[/yellow]")
+                return False
+
+            # New tab opened — switch to it and close all stale extras
+            if result == "new_tab_opened":
+                all_pages = context.pages
+                if len(all_pages) > 1:
+                    new_page = all_pages[-1]
+                    # Close all tabs except the LinkedIn tab (index 0) and the new one
+                    for p in all_pages[1:-1]:
+                        try:
+                            await p.close()
+                        except Exception:
+                            pass
+                    try:
+                        await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    console.print(f"  [dim]Switched to new tab: {new_page.url}[/dim]")
+                    current_page = new_page
+                consecutive_failures = 0
+                last_action_key = ""
+                continue
+
+            # Stuck detection: same failed action repeating
+            action_key = f"{action_data.get('action')}:{action_data.get('button_text', '')}"
+            if result == "button_not_found" or action_key == last_action_key:
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+            last_action_key = action_key
+
+            if consecutive_failures >= 3:
+                console.print(f"  [yellow]Stuck: same action failed {consecutive_failures}x — giving up[/yellow]")
                 return False
             # result is None → continue to next step
 

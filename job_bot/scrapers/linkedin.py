@@ -200,9 +200,26 @@ class LinkedInScraper(BaseScraper):
             external_id = str(job_id_attr)
             url = f"https://www.linkedin.com/jobs/view/{external_id}/"
 
-            title_el = await card.query_selector(".job-card-list__title--link, .job-card-list__title")
-            company_el = await card.query_selector(".artdeco-entity-lockup__subtitle, .job-card-container__primary-description")
-            location_el = await card.query_selector(".artdeco-entity-lockup__caption, .job-card-container__metadata-item")
+            title_el = await card.query_selector(
+                ".job-card-list__title--link, .job-card-list__title, "
+                ".job-card-container__title, "
+                "a[data-control-name='job_card_title'], "
+                "[class*='job-card'][class*='title'] a, "
+                "strong"
+            )
+            company_el = await card.query_selector(
+                ".artdeco-entity-lockup__subtitle, "
+                ".job-card-container__primary-description, "
+                ".job-card-container__company-name, "
+                "[class*='job-card'][class*='company'], "
+                "[class*='primary-description']"
+            )
+            location_el = await card.query_selector(
+                ".artdeco-entity-lockup__caption, "
+                ".job-card-container__metadata-item, "
+                "[class*='job-card'][class*='location'], "
+                "[class*='metadata-item']"
+            )
 
             title = (await title_el.inner_text()).strip().splitlines()[0].strip() if title_el else "Unknown"
             company = (await company_el.inner_text()).strip().splitlines()[0].strip() if company_el else "Unknown"
@@ -259,6 +276,23 @@ class LinkedInScraper(BaseScraper):
                 if desc_el:
                     job.description = (await desc_el.inner_text()).strip()
 
+            # Detect "No longer accepting applications"
+            top_card_el = await page.query_selector(
+                ".jobs-details-top-card__apply-error, "
+                ".jobs-details__hiring-stopped, "
+                "[class*='hiring-stopped'], "
+                ".jobs-apply-button--top-card"
+            )
+            page_text = await page.inner_text(".jobs-details__main-content, .job-view-layout") if not top_card_el else ""
+            if top_card_el:
+                card_text = (await top_card_el.inner_text()).lower()
+            else:
+                card_text = page_text.lower()
+            if "no longer accepting applications" in card_text:
+                console.print(f"  [yellow]Closed (no longer accepting): {job.external_id}[/yellow]")
+                job.status = "closed"
+                return job
+
             # Extract salary/insights if present
             salary_el = await page.query_selector(
                 ".job-details-jobs-unified-top-card__job-insight, "
@@ -271,6 +305,46 @@ class LinkedInScraper(BaseScraper):
         except Exception as e:
             console.print(f"  [yellow]Could not fetch detail for {job.external_id}: {e}[/yellow]")
         return job
+
+    async def _dismiss_easy_apply_modal(self, page) -> None:
+        """
+        Close the Easy Apply modal cleanly.
+        Clicks the modal X button and then handles the 'Save this application?' dialog
+        by clicking 'Discard'.
+        """
+        try:
+            # Click the X / Dismiss button on the Easy Apply modal
+            for close_sel in [
+                "button[aria-label='Dismiss']",
+                "button[aria-label='Close']",
+                ".jobs-easy-apply-modal button[aria-label='Dismiss']",
+                "[data-test-modal-close-btn]",
+            ]:
+                try:
+                    btn = await page.query_selector(close_sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(1.0)
+                        break
+                except Exception:
+                    continue
+
+            # Handle "Save this application?" confirmation dialog → click Discard
+            for discard_sel in [
+                "button:has-text('Discard')",
+                "button[data-control-name='discard_application_confirm_btn']",
+            ]:
+                try:
+                    discard_btn = await page.query_selector(discard_sel)
+                    if discard_btn and await discard_btn.is_visible():
+                        console.print("  [dim]Discarding unsaved application...[/dim]")
+                        await discard_btn.click()
+                        await asyncio.sleep(1.0)
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            console.print(f"  [yellow]Could not dismiss Easy Apply modal: {e}[/yellow]")
 
     async def _find_apply_button(self, page):
         """
@@ -467,13 +541,16 @@ class LinkedInScraper(BaseScraper):
                 await asyncio.sleep(1.5)
 
             console.print(f"  [yellow]Easy Apply: did not reach submit after {max_steps} steps[/yellow]")
+            await self._dismiss_easy_apply_modal(page)
             return False
 
         except PlaywrightTimeout:
             console.print(f"  [red]Timeout during Easy Apply for {job.url}[/red]")
+            await self._dismiss_easy_apply_modal(page)
             return False
         except Exception as e:
             console.print(f"  [red]Easy Apply error for {job.url}: {e}[/red]")
+            await self._dismiss_easy_apply_modal(page)
             return False
 
     async def _try_external_apply(self, page, apply_btn, job: Job, cover_letter: str) -> bool:
