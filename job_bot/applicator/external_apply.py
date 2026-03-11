@@ -99,8 +99,8 @@ async def extract_form_fields(page) -> list[dict]:
                 opts = await el.query_selector_all("option")
                 field["options"] = [(await o.inner_text()).strip() for o in opts]
 
-            # Skip fields with no identifier at all
-            if not field["id"] and not field["name"]:
+            # Skip fields with no identifier at all (id, name, aria-label, or placeholder)
+            if not field["id"] and not field["name"] and not field["aria_label"] and not field["placeholder"]:
                 continue
 
             fields.append(field)
@@ -136,16 +136,22 @@ Cover Letter (use if there is a cover letter field):
 
 Return JSON mapping field id or name to value. Use null for fields you should skip."""
 
+    from job_bot.ai.evaluator import _repair_and_parse
+
     raw = ollama_chat(
         system=FORM_FILLER_SYSTEM,
         user=user_msg,
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
-        max_tokens=1024,
+        max_tokens=2048,
     )
 
-    from job_bot.ai.evaluator import _repair_and_parse
-    return _repair_and_parse(raw)
+    try:
+        return _repair_and_parse(raw)
+    except Exception:
+        # If JSON is still broken, return empty dict — fields will be skipped
+        console.print("  [yellow]Form filler JSON parse failed — skipping AI fill[/yellow]")
+        return {}
 
 
 async def _fill_page_fields(page, fields: list[dict], job: Job, cover_letter: str) -> int:
@@ -155,15 +161,24 @@ async def _fill_page_fields(page, fields: list[dict], job: Job, cover_letter: st
     mapping = await fill_form_with_ai(page, fields, job, cover_letter)
     filled = 0
     for field in fields:
-        key = field["id"] or field["name"]
+        key = field["id"] or field["name"] or field["aria_label"] or field["placeholder"]
         value = mapping.get(key)
         if not value:
             continue
         try:
-            selector = f'#{field["id"]}' if field["id"] else f'[name="{field["name"]}"]'
-            el = await page.query_selector(selector)
+            # Build selector chain: id > name > aria-label > placeholder
+            el = None
+            if field["id"]:
+                el = await page.query_selector(f'#{field["id"]}')
+            if not el and field["name"]:
+                el = await page.query_selector(f'[name="{field["name"]}"]')
+            if not el and field["aria_label"]:
+                el = await page.query_selector(f'[aria-label="{field["aria_label"]}"]')
+            if not el and field["placeholder"]:
+                el = await page.query_selector(f'[placeholder="{field["placeholder"]}"]')
             if not el:
                 continue
+            selector = f'#{field["id"]}' if field["id"] else f'[name="{field["name"]}"]'
             if field["tag"] == "select":
                 try:
                     await el.select_option(label=str(value))

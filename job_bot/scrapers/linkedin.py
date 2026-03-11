@@ -611,8 +611,13 @@ class LinkedInScraper(BaseScraper):
             console.print(f"  [red]External apply error: {e}[/red]")
             result = False
         finally:
-            if new_page is not None and new_page is not page:
-                await new_page.close()
+            # Close every tab that isn't the LinkedIn page to restore clean state
+            for p in list(page.context.pages):
+                if p is not page:
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
 
         return result
 
